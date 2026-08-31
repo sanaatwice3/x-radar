@@ -13,7 +13,7 @@ const STOP_WORDS = new Set([
   "how","why","now","new","get","got","one","two","too"
 ]);
 
-const BLOCKED_PHRASES = [
+const BLOCKED = [
   "join telegram",
   "telegram group",
   "signal group",
@@ -21,18 +21,15 @@ const BLOCKED_PHRASES = [
   "contract address",
   "drop your wallet",
   "send wallet",
-  "whitelist spot",
   "presale",
   "100x",
   "1000x",
   "buy now",
   "dm me",
-  "stay locked in",
-  "call channel",
-  "paid group"
+  "stay locked in"
 ];
 
-const DISCOVERY_QUERIES = [
+const SENSORS = [
   "breaking OR confirmed OR announced OR launch",
   "viral OR trending OR controversy OR scandal OR drama",
   "meme OR funny OR weird OR absurd OR insane",
@@ -47,22 +44,19 @@ const DISCOVERY_QUERIES = [
   "Elon OR Musk OR Trump OR Robinhood OR Coinbase OR Binance"
 ];
 
-function clamp(n, min, max, fallback) {
-  const value = Number(n);
-  if (!Number.isFinite(value)) return fallback;
-  return Math.min(Math.max(value, min), max);
+function clamp(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(n, min), max);
 }
 
-function normalizeTweets(data) {
-  return (
-    data?.tweets ||
-    data?.data?.tweets ||
-    data?.data ||
-    []
-  );
+function tweetArray(data) {
+  if (Array.isArray(data?.tweets)) return data.tweets;
+  if (Array.isArray(data?.data?.tweets)) return data.data.tweets;
+  return [];
 }
 
-async function searchPage(apiKey, query, since, cursor = null) {
+async function getPage(apiKey, query, since, cursor) {
   const url = new URL(API_URL);
 
   url.searchParams.set(
@@ -85,46 +79,89 @@ async function searchPage(apiKey, query, since, cursor = null) {
   if (!response.ok) {
     return {
       tweets: [],
-      cursor: null
+      nextCursor: null,
+      hasNext: false,
+      status: response.status
     };
   }
 
   const data = await response.json();
 
   return {
-    tweets: normalizeTweets(data),
-    cursor:
+    tweets: tweetArray(data),
+
+    nextCursor:
       data?.next_cursor ||
       data?.nextCursor ||
-      data?.cursor?.next ||
-      null
+      null,
+
+    hasNext:
+      data?.has_next_page ??
+      data?.hasNextPage ??
+      Boolean(
+        data?.next_cursor ||
+        data?.nextCursor
+      ),
+
+    status: response.status
   };
 }
 
-async function searchSensor(
+async function collectSensor(
   apiKey,
   query,
   since,
-  pages = 2
+  maxPages
 ) {
   const tweets = [];
-  let cursor = null;
+  const seen = new Set();
 
-  for (let i = 0; i < pages; i++) {
-    const page = await searchPage(
+  let cursor = null;
+  let pagesFetched = 0;
+
+  for (
+    let pageNumber = 0;
+    pageNumber < maxPages;
+    pageNumber++
+  ) {
+    const page = await getPage(
       apiKey,
       query,
       since,
       cursor
     );
 
-    tweets.push(...page.tweets);
+    pagesFetched++;
 
-    if (!page.cursor) break;
-    cursor = page.cursor;
+    for (const tweet of page.tweets) {
+      if (!tweet?.id) continue;
+
+      if (!seen.has(tweet.id)) {
+        seen.add(tweet.id);
+        tweets.push(tweet);
+      }
+    }
+
+    if (
+      !page.hasNext ||
+      !page.nextCursor
+    ) {
+      break;
+    }
+
+    if (page.nextCursor === cursor) {
+      break;
+    }
+
+    cursor = page.nextCursor;
   }
 
-  return tweets;
+  return {
+    query,
+    pagesFetched,
+    count: tweets.length,
+    tweets
+  };
 }
 
 function cleanText(text = "") {
@@ -134,11 +171,7 @@ function cleanText(text = "") {
     .trim();
 }
 
-function isLikelyReply(text = "") {
-  return text.trim().startsWith("@");
-}
-
-function hasCryptoAddress(text = "") {
+function cryptoAddress(text = "") {
   const evm =
     /\b0x[a-fA-F0-9]{40}\b/;
 
@@ -152,17 +185,20 @@ function hasCryptoAddress(text = "") {
 }
 
 function isNoise(text = "") {
-  const t = text.toLowerCase().trim();
+  const t = text
+    .toLowerCase()
+    .trim();
 
   if (!t) return true;
 
-  if (isLikelyReply(t)) {
+  if (t.startsWith("@")) {
     return true;
   }
 
   if (
-    BLOCKED_PHRASES.some((x) =>
-      t.includes(x)
+    BLOCKED.some(
+      (phrase) =>
+        t.includes(phrase)
     )
   ) {
     return true;
@@ -176,32 +212,31 @@ function isNoise(text = "") {
   }
 
   if (
-    hasCryptoAddress(text) &&
+    cryptoAddress(text) &&
     (
       t.includes("moon") ||
-      t.includes("mc") ||
       t.includes("entry") ||
-      t.includes("ape")
+      t.includes("ape") ||
+      t.includes("mc")
     )
   ) {
     return true;
   }
 
-  if (
-    cleanText(text).length < 18
-  ) {
+  if (cleanText(text).length < 15) {
     return true;
   }
 
   return false;
 }
 
-function ageBoost(ageMinutes) {
-  if (ageMinutes <= 1) return 5;
-  if (ageMinutes <= 2) return 4;
-  if (ageMinutes <= 5) return 3;
-  if (ageMinutes <= 10) return 2;
-  if (ageMinutes <= 20) return 1.3;
+function ageBoost(age) {
+  if (age <= 1) return 5;
+  if (age <= 2) return 4;
+  if (age <= 5) return 3;
+  if (age <= 10) return 2;
+  if (age <= 20) return 1.3;
+
   return 1;
 }
 
@@ -215,122 +250,104 @@ function extractKeywords(text = "") {
     )
     .toLowerCase();
 
-  const words = cleaned
-    .split(/\s+/)
-    .filter(Boolean)
-    .filter((word) => word.length >= 3)
-    .filter((word) => !STOP_WORDS.has(word));
+  const output = [];
 
-  const unique = [];
+  for (
+    const word of cleaned
+      .split(/\s+/)
+      .filter(Boolean)
+  ) {
+    if (word.length < 3) continue;
+    if (STOP_WORDS.has(word)) continue;
 
-  for (const word of words) {
-    if (!unique.includes(word)) {
-      unique.push(word);
+    if (!output.includes(word)) {
+      output.push(word);
     }
 
-    if (unique.length >= 18) {
-      break;
-    }
+    if (output.length >= 20) break;
   }
 
-  return unique;
+  return output;
 }
 
-function extractPhrases(text = "") {
-  const raw = cleanText(text)
-    .replace(/@\w+/g, " ");
-
-  const matches = [];
+function extractEntities(text = "") {
+  const cleaned =
+    cleanText(text);
 
   const caps =
-    raw.match(
+    cleaned.match(
       /\b[A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*){0,3}\b/g
     ) || [];
 
   const tickers =
-    raw.match(
+    cleaned.match(
       /\$[A-Za-z][A-Za-z0-9]{1,10}/g
     ) || [];
 
   const hashtags =
-    raw.match(
+    cleaned.match(
       /#[A-Za-z][A-Za-z0-9_]{2,30}/g
     ) || [];
 
-  for (const x of [
-    ...caps,
-    ...tickers,
-    ...hashtags
-  ]) {
-    const value = x
-      .trim()
-      .toLowerCase();
-
-    if (
-      value.length >= 3 &&
-      !matches.includes(value)
-    ) {
-      matches.push(value);
-    }
-  }
-
-  return matches.slice(0, 10);
+  return [
+    ...new Set(
+      [
+        ...caps,
+        ...tickers,
+        ...hashtags
+      ]
+        .map((x) =>
+          x.toLowerCase()
+        )
+        .filter(
+          (x) =>
+            x.length >= 3
+        )
+    )
+  ].slice(0, 12);
 }
 
 function jaccard(a, b) {
-  const A = new Set(a);
-  const B = new Set(b);
-
-  if (!A.size || !B.size) {
+  if (!a.length || !b.length) {
     return 0;
   }
 
-  let intersection = 0;
+  const A = new Set(a);
+  const B = new Set(b);
+
+  let shared = 0;
 
   for (const x of A) {
     if (B.has(x)) {
-      intersection++;
+      shared++;
     }
   }
 
-  const union =
-    new Set([...A, ...B]).size;
-
-  return intersection / union;
-}
-
-function phraseOverlap(a, b) {
-  return a.some(
-    (x) =>
-      b.includes(x) &&
-      x.length >= 4
+  return (
+    shared /
+    new Set([...A, ...B]).size
   );
 }
 
-function strongKeywordOverlap(a, b) {
-  const shared = a.filter(
-    (x) => b.includes(x)
-  );
+function clusterMatch(a, b) {
+  const entityMatch =
+    a.entities.some(
+      (x) =>
+        x.length >= 4 &&
+        b.entities.includes(x)
+    );
 
-  return shared.length >= 2;
-}
-
-function canCluster(a, b) {
-  if (
-    phraseOverlap(
-      a.phrases,
-      b.phrases
-    )
-  ) {
+  if (entityMatch) {
     return true;
   }
 
-  if (
-    strongKeywordOverlap(
-      a.keywords,
-      b.keywords
-    )
-  ) {
+  const common =
+    a.keywords.filter(
+      (x) =>
+        b.keywords.includes(x)
+    );
+
+  if (common.length >= 2) {
     return true;
   }
 
@@ -338,7 +355,7 @@ function canCluster(a, b) {
     jaccard(
       a.keywords,
       b.keywords
-    ) >= 0.22
+    ) >= 0.2
   );
 }
 
@@ -346,39 +363,25 @@ function buildClusters(tweets) {
   const clusters = [];
 
   for (const tweet of tweets) {
-    let bestIndex = -1;
-    let bestScore = 0;
+    let target = null;
 
-    for (
-      let i = 0;
-      i < clusters.length;
-      i++
-    ) {
-      const cluster = clusters[i];
-
-      for (const member of cluster) {
-        if (!canCluster(tweet, member)) {
-          continue;
-        }
-
-        const score =
-          jaccard(
-            tweet.keywords,
-            member.keywords
-          );
-
-        if (
-          score > bestScore ||
-          bestIndex === -1
-        ) {
-          bestScore = score;
-          bestIndex = i;
-        }
+    for (const cluster of clusters) {
+      if (
+        cluster.some(
+          (member) =>
+            clusterMatch(
+              tweet,
+              member
+            )
+        )
+      ) {
+        target = cluster;
+        break;
       }
     }
 
-    if (bestIndex >= 0) {
-      clusters[bestIndex].push(tweet);
+    if (target) {
+      target.push(tweet);
     } else {
       clusters.push([tweet]);
     }
@@ -387,56 +390,50 @@ function buildClusters(tweets) {
   return clusters;
 }
 
-function makeNarrativeName(cluster) {
-  const phraseCounts = {};
+function narrativeName(cluster) {
+  const entityCounts = {};
   const keywordCounts = {};
 
   for (const tweet of cluster) {
-    for (const phrase of tweet.phrases) {
-      phraseCounts[phrase] =
-        (phraseCounts[phrase] || 0) + 1;
+    for (const x of tweet.entities) {
+      entityCounts[x] =
+        (entityCounts[x] || 0) + 1;
     }
 
-    for (const word of tweet.keywords) {
-      keywordCounts[word] =
-        (keywordCounts[word] || 0) + 1;
+    for (const x of tweet.keywords) {
+      keywordCounts[x] =
+        (keywordCounts[x] || 0) + 1;
     }
   }
 
-  const bestPhrase =
-    Object.entries(phraseCounts)
-      .filter(([, count]) => count >= 2)
-      .sort((a, b) => {
-        if (b[1] !== a[1]) {
-          return b[1] - a[1];
-        }
+  const entities =
+    Object.entries(entityCounts)
+      .filter(
+        ([, count]) =>
+          count >= 2
+      )
+      .sort(
+        (a, b) =>
+          b[1] - a[1]
+      )
+      .slice(0, 3)
+      .map(([x]) => x);
 
-        return b[0].length - a[0].length;
-      })[0]?.[0];
-
-  if (bestPhrase) {
-    return bestPhrase;
+  if (entities.length) {
+    return entities.join(" ");
   }
 
-  const bestWords =
-    Object.entries(keywordCounts)
-      .sort((a, b) => {
-        if (b[1] !== a[1]) {
-          return b[1] - a[1];
-        }
-
-        return b[0].length - a[0].length;
-      })
-      .slice(0, 4)
-      .map(([word]) => word);
-
-  return (
-    bestWords.join(" ") ||
-    "unknown narrative"
-  );
+  return Object.entries(keywordCounts)
+    .sort(
+      (a, b) =>
+        b[1] - a[1]
+    )
+    .slice(0, 4)
+    .map(([x]) => x)
+    .join(" ");
 }
 
-function getTweetMetrics(tweet, minutes) {
+function processTweet(tweet, windowMinutes) {
   const author =
     tweet.author ||
     tweet.user ||
@@ -447,6 +444,9 @@ function getTweetMetrics(tweet, minutes) {
     author.username ||
     tweet.userName ||
     "";
+
+  const text =
+    tweet.text || "";
 
   const likes =
     Number(tweet.likeCount) || 0;
@@ -463,25 +463,24 @@ function getTweetMetrics(tweet, minutes) {
   const views =
     Number(tweet.viewCount) || 0;
 
-  const createdAt =
-    tweet.createdAt || null;
+  let ageMinutes =
+    windowMinutes;
 
-  let ageMinutes = minutes;
+  if (tweet.createdAt) {
+    const ts =
+      new Date(
+        tweet.createdAt
+      ).getTime();
 
-  if (createdAt) {
-    const timestamp =
-      new Date(createdAt).getTime();
-
-    if (
-      !Number.isNaN(timestamp)
-    ) {
-      ageMinutes = Math.max(
-        0.25,
-        (
-          Date.now() -
-          timestamp
-        ) / 60000
-      );
+    if (!Number.isNaN(ts)) {
+      ageMinutes =
+        Math.max(
+          0.25,
+          (
+            Date.now() -
+            ts
+          ) / 60000
+        );
     }
   }
 
@@ -492,43 +491,50 @@ function getTweetMetrics(tweet, minutes) {
     quotes * 3;
 
   const velocity =
-    engagement / ageMinutes;
+    engagement /
+    ageMinutes;
 
   const earlyScore =
     velocity *
       ageBoost(ageMinutes) +
     Math.log10(views + 1);
 
-  const text =
-    tweet.text || "";
-
   return {
     id: tweet.id,
     text,
     username,
-    createdAt,
+
+    createdAt:
+      tweet.createdAt || null,
+
     ageMinutes:
       Number(
         ageMinutes.toFixed(2)
       ),
+
     likes,
     replies,
     reposts,
     quotes,
     views,
     engagement,
+
     velocity:
       Number(
         velocity.toFixed(2)
       ),
+
     earlyScore:
       Number(
         earlyScore.toFixed(2)
       ),
+
     keywords:
       extractKeywords(text),
-    phrases:
-      extractPhrases(text),
+
+    entities:
+      extractEntities(text),
+
     url:
       tweet.twitterUrl ||
       tweet.url ||
@@ -540,74 +546,43 @@ function getTweetMetrics(tweet, minutes) {
   };
 }
 
-function narrativeStatus({
-  uniqueAccounts,
-  avgAge,
-  score,
-  mentions
-}) {
-  if (
-    uniqueAccounts >= 5 &&
-    score >= 80
-  ) {
-    return "BREAKING";
-  }
-
-  if (
-    uniqueAccounts >= 3 &&
-    score >= 25
-  ) {
-    return "RISING";
-  }
-
-  if (
-    uniqueAccounts >= 2 &&
-    avgAge <= 5
-  ) {
-    return "EARLY";
-  }
-
-  if (
-    mentions >= 2
-  ) {
-    return "WATCH";
-  }
-
-  return "SINGLE";
-}
-
 module.exports = async function (req, res) {
   try {
     const apiKey =
       process.env.TWITTER_API_KEY;
 
     if (!apiKey) {
-      return res.status(500).json({
-        error:
-          "TWITTER_API_KEY missing"
-      });
+      return res
+        .status(500)
+        .json({
+          error:
+            "TWITTER_API_KEY missing"
+        });
     }
 
-    const minutes = clamp(
-      req.query.minutes,
-      5,
-      1440,
-      30
-    );
+    const minutes =
+      clamp(
+        req.query.minutes,
+        5,
+        1440,
+        30
+      );
 
-    const limit = clamp(
-      req.query.limit,
-      1,
-      50,
-      20
-    );
+    const limit =
+      clamp(
+        req.query.limit,
+        1,
+        50,
+        20
+      );
 
-    const pagesPerSensor = clamp(
-      req.query.pages,
-      1,
-      3,
-      2
-    );
+    const pages =
+      clamp(
+        req.query.pages,
+        1,
+        5,
+        3
+      );
 
     const since =
       Math.floor(
@@ -615,58 +590,68 @@ module.exports = async function (req, res) {
       ) -
       minutes * 60;
 
-    const groups =
+    const sensorResults =
       await Promise.all(
-        DISCOVERY_QUERIES.map(
+        SENSORS.map(
           (query) =>
-            searchSensor(
+            collectSensor(
               apiKey,
               query,
               since,
-              pagesPerSensor
+              pages
             )
         )
+      );
+
+    const raw =
+      sensorResults.flatMap(
+        (x) => x.tweets
       );
 
     const unique =
       Array.from(
         new Map(
-          groups
-            .flat()
-            .map((tweet) => [
+          raw.map(
+            (tweet) => [
               tweet.id,
               tweet
-            ])
+            ]
+          )
         ).values()
       );
 
     const processed =
       unique
-        .map((tweet) =>
-          getTweetMetrics(
-            tweet,
-            minutes
-          )
+        .map(
+          (tweet) =>
+            processTweet(
+              tweet,
+              minutes
+            )
         )
         .filter(
           (tweet) =>
-            !isNoise(tweet.text)
+            !isNoise(
+              tweet.text
+            )
         )
-        .filter((tweet) => {
-          if (
-            tweet.ageMinutes <= 5
-          ) {
+        .filter(
+          (tweet) => {
+            if (
+              tweet.ageMinutes <= 5
+            ) {
+              return (
+                tweet.engagement > 0 ||
+                tweet.views >= 3
+              );
+            }
+
             return (
               tweet.engagement > 0 ||
-              tweet.views >= 5
+              tweet.views >= 15
             );
           }
-
-          return (
-            tweet.engagement > 0 ||
-            tweet.views >= 20
-          );
-        })
+        )
         .sort(
           (a, b) =>
             b.earlyScore -
@@ -674,206 +659,204 @@ module.exports = async function (req, res) {
         );
 
     const clusters =
-      buildClusters(processed);
+      buildClusters(
+        processed
+      );
 
     const narratives =
       clusters
         .map((cluster) => {
-          const uniqueAccounts =
+          const accounts =
             new Set(
               cluster
                 .map(
-                  (tweet) =>
-                    tweet.username
+                  (x) =>
+                    x.username
                 )
                 .filter(Boolean)
-            ).size;
+            );
+
+          const uniqueAccounts =
+            accounts.size;
 
           const mentions =
             cluster.length;
 
           const avgAge =
             cluster.reduce(
-              (sum, tweet) =>
+              (sum, x) =>
                 sum +
-                tweet.ageMinutes,
+                x.ageMinutes,
               0
             ) / mentions;
 
           const engagement =
             cluster.reduce(
-              (sum, tweet) =>
+              (sum, x) =>
                 sum +
-                tweet.engagement,
+                x.engagement,
               0
             );
 
           const views =
             cluster.reduce(
-              (sum, tweet) =>
+              (sum, x) =>
                 sum +
-                tweet.views,
+                x.views,
               0
             );
 
           const velocity =
             cluster.reduce(
-              (sum, tweet) =>
+              (sum, x) =>
                 sum +
-                tweet.velocity,
+                x.velocity,
               0
             );
 
-          let accountBoost = 1;
-
-          if (
-            uniqueAccounts >= 2
-          ) {
-            accountBoost = 1.8;
-          }
-
-          if (
-            uniqueAccounts >= 3
-          ) {
-            accountBoost = 2.8;
-          }
-
-          if (
+          const accountBoost =
             uniqueAccounts >= 5
-          ) {
-            accountBoost = 4;
-          }
+              ? 4
+              : uniqueAccounts >= 3
+                ? 2.8
+                : uniqueAccounts >= 2
+                  ? 1.8
+                  : 1;
 
-          let burstBoost = 1;
-
-          if (avgAge <= 2) {
-            burstBoost = 3;
-          } else if (
-            avgAge <= 5
-          ) {
-            burstBoost = 2;
-          } else if (
-            avgAge <= 10
-          ) {
-            burstBoost = 1.4;
-          }
+          const burstBoost =
+            avgAge <= 2
+              ? 3
+              : avgAge <= 5
+                ? 2
+                : avgAge <= 10
+                  ? 1.4
+                  : 1;
 
           const score =
             (
               velocity +
-              Math.log10(views + 1) +
+              Math.log10(
+                views + 1
+              ) +
               mentions
             ) *
             accountBoost *
             burstBoost;
 
-          const status =
-            narrativeStatus({
-              uniqueAccounts,
-              avgAge,
-              score,
-              mentions
-            });
+          let status = "WATCH";
 
-          const topTweets =
-            [...cluster]
-              .sort(
-                (a, b) =>
-                  b.earlyScore -
-                  a.earlyScore
-              )
-              .slice(0, 4)
-              .map((tweet) => ({
-                username:
-                  tweet.username,
-                text:
-                  tweet.text,
-                ageMinutes:
-                  tweet.ageMinutes,
-                engagement:
-                  tweet.engagement,
-                views:
-                  tweet.views,
-                score:
-                  tweet.earlyScore,
-                url:
-                  tweet.url
-              }));
+          if (
+            uniqueAccounts >= 2 &&
+            avgAge <= 5
+          ) {
+            status = "EARLY";
+          }
+
+          if (
+            uniqueAccounts >= 3 &&
+            score >= 25
+          ) {
+            status = "RISING";
+          }
+
+          if (
+            uniqueAccounts >= 5 &&
+            score >= 80
+          ) {
+            status = "BREAKING";
+          }
 
           return {
             narrative:
-              makeNarrativeName(
+              narrativeName(
                 cluster
               ),
+
             status,
             mentions,
             uniqueAccounts,
+
             avgAgeMinutes:
               Number(
                 avgAge.toFixed(2)
               ),
+
             engagement,
             views,
+
             velocity:
               Number(
                 velocity.toFixed(2)
               ),
+
             score:
               Number(
                 score.toFixed(2)
               ),
-            topTweets
+
+            topTweets:
+              [...cluster]
+                .sort(
+                  (a, b) =>
+                    b.earlyScore -
+                    a.earlyScore
+                )
+                .slice(0, 4)
+                .map((x) => ({
+                  username:
+                    x.username,
+
+                  text:
+                    x.text,
+
+                  ageMinutes:
+                    x.ageMinutes,
+
+                  engagement:
+                    x.engagement,
+
+                  views:
+                    x.views,
+
+                  url:
+                    x.url
+                }))
           };
         })
         .filter(
-          (narrative) =>
-            narrative.uniqueAccounts >= 2
+          (x) =>
+            x.uniqueAccounts >= 2
         )
         .sort(
           (a, b) =>
-            b.score -
-            a.score
+            b.score - a.score
         )
         .slice(0, limit);
 
-    const singles =
+    const signals =
       processed
         .filter(
-          (tweet) =>
-            tweet.ageMinutes <= 5
-        )
-        .filter(
-          (tweet) =>
-            tweet.earlyScore >= 1
+          (x) =>
+            x.ageMinutes <= 5
         )
         .slice(0, 15)
-        .map((tweet) => ({
-          text:
-            tweet.text,
-          username:
-            tweet.username,
-          ageMinutes:
-            tweet.ageMinutes,
-          engagement:
-            tweet.engagement,
-          views:
-            tweet.views,
-          score:
-            tweet.earlyScore,
-          url:
-            tweet.url
+        .map((x) => ({
+          text: x.text,
+          username: x.username,
+          ageMinutes: x.ageMinutes,
+          engagement: x.engagement,
+          views: x.views,
+          score: x.earlyScore,
+          url: x.url
         }));
 
-    const earlyNarratives =
-      narratives.filter(
-        (narrative) =>
-          [
-            "EARLY",
-            "RISING",
-            "BREAKING"
-          ].includes(
-            narrative.status
-          )
+    const sensorStats =
+      sensorResults.map(
+        (x) => ({
+          query: x.query,
+          pages: x.pagesFetched,
+          tweets: x.count
+        })
       );
 
     return res
@@ -882,15 +865,19 @@ module.exports = async function (req, res) {
         ok: true,
 
         mode:
-          "full-narrative-radar",
+          "narrative-radar-v2",
 
         windowMinutes:
           minutes,
 
-        sensors:
-          DISCOVERY_QUERIES.length,
+        pagesRequested:
+          pages,
 
-        pagesPerSensor,
+        sensors:
+          SENSORS.length,
+
+        rawFetched:
+          raw.length,
 
         scanned:
           unique.length,
@@ -901,13 +888,11 @@ module.exports = async function (req, res) {
         narrativeCount:
           narratives.length,
 
-        earlyNarrativeCount:
-          earlyNarratives.length,
-
         narratives,
 
-        signals:
-          singles
+        signals,
+
+        sensorStats
       });
 
   } catch (error) {
