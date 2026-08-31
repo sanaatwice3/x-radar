@@ -11,10 +11,20 @@ module.exports = async function handler(req, res) {
 
   const apiKey = process.env.TWITTER_API_KEY;
   const q = String(req.query.q || "").trim();
+
   const minutes = Math.min(
     Math.max(Number(req.query.minutes) || 60, 1),
     10080
   );
+
+  const limit = Math.min(
+    Math.max(Number(req.query.limit) || 20, 1),
+    50
+  );
+
+  const sort = String(
+    req.query.sort || "latest"
+  ).toLowerCase();
 
   if (!apiKey) {
     return res.status(500).json({
@@ -30,7 +40,8 @@ module.exports = async function handler(req, res) {
 
   try {
     const sinceTime =
-      Math.floor(Date.now() / 1000) - minutes * 60;
+      Math.floor(Date.now() / 1000) -
+      minutes * 60;
 
     const url = new URL(API_URL);
 
@@ -59,19 +70,98 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    const tweets =
+    const rawTweets =
       data.tweets ||
       data.data?.tweets ||
       [];
+
+    const tweets = rawTweets.map((tweet) => {
+      const author =
+        tweet.author ||
+        tweet.user ||
+        {};
+
+      const username =
+        author.userName ||
+        author.username ||
+        tweet.userName ||
+        "";
+
+      const likes =
+        Number(tweet.likeCount) || 0;
+
+      const replies =
+        Number(tweet.replyCount) || 0;
+
+      const reposts =
+        Number(
+          tweet.retweetCount ||
+          tweet.repostCount
+        ) || 0;
+
+      const quotes =
+        Number(tweet.quoteCount) || 0;
+
+      const views =
+        Number(tweet.viewCount) || 0;
+
+      const engagement =
+        likes +
+        replies * 2 +
+        reposts * 2 +
+        quotes * 2;
+
+      return {
+        id: tweet.id,
+        text: tweet.text || "",
+        username,
+        name:
+          author.name ||
+          tweet.name ||
+          "",
+        createdAt:
+          tweet.createdAt ||
+          tweet.created_at ||
+          null,
+        likes,
+        replies,
+        reposts,
+        quotes,
+        views,
+        engagement,
+        url:
+          tweet.twitterUrl ||
+          tweet.url ||
+          (
+            username && tweet.id
+              ? `https://x.com/${username}/status/${tweet.id}`
+              : null
+          )
+      };
+    });
+
+    const sortedTweets =
+      sort === "engagement"
+        ? tweets.sort(
+            (a, b) =>
+              b.engagement -
+              a.engagement
+          )
+        : tweets;
 
     return res.status(200).json({
       ok: true,
       query: q,
       minutes,
-      count: Array.isArray(tweets)
-        ? tweets.length
-        : 0,
-      tweets
+      sort,
+      count: Math.min(
+        sortedTweets.length,
+        limit
+      ),
+      tweets: sortedTweets.slice(
+        0,
+        limit
+      )
     });
 
   } catch (error) {
