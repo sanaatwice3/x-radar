@@ -1,6 +1,3 @@
-const API_URL =
-  "https://api.twitterapi.io/twitter/tweet/advanced_search";
-
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Cache-Control", "no-store");
@@ -9,16 +6,16 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "GET only" });
   }
 
-  const apiKey = process.env.TWITTER_API_KEY;
+  const bearerToken = process.env.X_BEARER_TOKEN;
   const q = String(req.query.q || "").trim();
   const minutes = Math.min(
     Math.max(Number(req.query.minutes) || 60, 1),
     10080
   );
 
-  if (!apiKey) {
+  if (!bearerToken) {
     return res.status(500).json({
-      error: "TWITTER_API_KEY is not configured",
+      error: "X_BEARER_TOKEN is not configured",
     });
   }
 
@@ -29,20 +26,33 @@ export default async function handler(req, res) {
   }
 
   try {
-    const sinceTime =
-      Math.floor(Date.now() / 1000) -
-      minutes * 60;
+    const startTime = new Date(
+      Date.now() - minutes * 60 * 1000
+    ).toISOString();
 
-    const searchQuery =
-      `${q} since_time:${sinceTime}`;
+    const url = new URL(
+      "https://api.x.com/2/tweets/search/recent"
+    );
 
-    const url = new URL(API_URL);
-    url.searchParams.set("query", searchQuery);
-    url.searchParams.set("queryType", "Latest");
+    url.searchParams.set("query", q);
+    url.searchParams.set("start_time", startTime);
+    url.searchParams.set("max_results", "10");
+    url.searchParams.set(
+      "tweet.fields",
+      "created_at,public_metrics,author_id,lang"
+    );
+    url.searchParams.set(
+      "expansions",
+      "author_id"
+    );
+    url.searchParams.set(
+      "user.fields",
+      "username,name"
+    );
 
     const response = await fetch(url, {
       headers: {
-        "X-API-Key": apiKey,
+        Authorization: `Bearer ${bearerToken}`,
       },
     });
 
@@ -50,25 +60,18 @@ export default async function handler(req, res) {
 
     if (!response.ok) {
       return res.status(response.status).json({
-        error: "TwitterAPI.io error",
+        error: "X API error",
         details: data,
       });
     }
-
-    const tweets =
-      data.tweets ||
-      data.data?.tweets ||
-      [];
 
     return res.status(200).json({
       ok: true,
       query: q,
       minutes,
       fetchedAt: new Date().toISOString(),
-      count: Array.isArray(tweets)
-        ? tweets.length
-        : 0,
-      tweets,
+      count: data.meta?.result_count || 0,
+      data,
     });
   } catch (error) {
     return res.status(500).json({
