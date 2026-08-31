@@ -7,10 +7,19 @@ module.exports = async function (req, res) {
 
   try {
     const apiKey = process.env.TWITTER_API_KEY;
-    const topic = String(req.query.topic || "crypto").trim();
+
+    const topic = String(
+      req.query.topic || "crypto"
+    ).trim();
+
     const minutes = Math.min(
       Math.max(Number(req.query.minutes) || 30, 1),
       1440
+    );
+
+    const limit = Math.min(
+      Math.max(Number(req.query.limit) || 10, 1),
+      20
     );
 
     if (!apiKey) {
@@ -50,23 +59,20 @@ module.exports = async function (req, res) {
       });
     }
 
-    const tweets =
+    const rawTweets =
       data.tweets ||
       data.data?.tweets ||
       [];
 
-    return res.status(200).json({
-      ok: true,
-      radar: true,
-      topic,
-      minutes,
-      count: tweets.length,
-      tweets
-    });
-
-  } catch (error) {
-    return res.status(500).json({
-      error: String(error)
-    });
-  }
-};
+    const spamWords = [
+      "join telegram",
+      "private alpha",
+      "vip group",
+      "100x",
+      "1000x",
+      "guaranteed",
+      "buy now",
+      "presale",
+      "contract address",
+      "dm me",
+      "signal
