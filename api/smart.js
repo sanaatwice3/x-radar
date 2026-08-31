@@ -1,24 +1,4 @@
-const API_URL =
-  "https://api.twitterapi.io/twitter/user/followings";
-
-/*
-|--------------------------------------------------------------------------
-| X RADAR — SMART GRAPH
-|--------------------------------------------------------------------------
-|
-| Features:
-| - Smart/KOL recent-following scanner
-| - Batch scanning
-| - TwitterAPI.io rate-limit protection
-| - User field normalization
-| - Smart-follow overlap detection
-| - Early project scoring
-| - Ultra Early <= 3 days
-| - Ready for Telegram integration
-|
-| Narrative Radar v4 is NOT touched.
-|--------------------------------------------------------------------------
-*/
+const API_BASE = "https://api.twitterapi.io";
 
 const SMART_SEEDS = [
   "0xngmi",
@@ -26,50 +6,45 @@ const SMART_SEEDS = [
   "Route2FI",
   "Dynamo_Patrick",
   "TheDeFinvestor",
-  "blocmatesdotcom"
+  "blocmatesdotcom",
 ];
 
-const SEEDS_PER_BATCH = 3;
+const BATCH_SIZE = 3;
+const REQUEST_DELAY_MS = 5200;
+const RETRY_DELAY_MS = 5500;
 
-const sleep = (ms) =>
-  new Promise((resolve) => setTimeout(resolve, ms));
+// Redis key. Satu snapshot menyimpan kondisi Smart Graph scan sebelumnya.
+const SNAPSHOT_KEY = "x-radar:smart-graph:snapshot:v1";
 
-/*
-|--------------------------------------------------------------------------
-| HELPERS
-|--------------------------------------------------------------------------
-*/
-
-function clamp(value, min, max, fallback) {
-  const n = Number(value);
-
-  if (!Number.isFinite(n)) {
-    return fallback;
-  }
-
-  return Math.min(Math.max(n, min), max);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function numberField(user, ...fields) {
-  for (const field of fields) {
-    const value = Number(user?.[field]);
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
 
-    if (Number.isFinite(value)) {
-      return value;
+function numberField(obj, ...fields) {
+  for (const field of fields) {
+    const value = obj?.[field];
+
+    if (value !== undefined && value !== null && value !== "") {
+      const parsed = Number(value);
+
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
     }
   }
 
   return 0;
 }
 
-function stringField(user, ...fields) {
+function stringField(obj, ...fields) {
   for (const field of fields) {
-    const value = user?.[field];
+    const value = obj?.[field];
 
-    if (
-      typeof value === "string" &&
-      value.trim()
-    ) {
+    if (typeof value === "string" && value.trim()) {
       return value.trim();
     }
   }
@@ -77,15 +52,100 @@ function stringField(user, ...fields) {
   return "";
 }
 
+function booleanField(obj, ...fields) {
+  for (const field of fields) {
+    if (typeof obj?.[field] === "boolean") {
+      return obj[field];
+    }
+  }
+
+  return false;
+}
+
+function normalizeUser(raw) {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+
+  // Beberapa response API dapat membungkus user di property "user".
+  const user =
+    raw.user && typeof raw.user === "object"
+      ? raw.user
+      : raw;
+
+  const username = stringField(
+    user,
+    "userName",
+    "username",
+    "screen_name",
+    "screenName"
+  ).replace(/^@/, "");
+
+  if (!username) {
+    return null;
+  }
+
+  return {
+    username,
+    name: stringField(user, "name", "displayName"),
+    description: stringField(
+      user,
+      "description",
+      "bio"
+    ),
+
+    followers: numberField(
+      user,
+      "followers_count",
+      "followersCount",
+      "followers"
+    ),
+
+    following: numberField(
+      user,
+      "following_count",
+      "followingCount",
+      "following",
+      "friends_count"
+    ),
+
+    statuses: numberField(
+      user,
+      "tweet_count",
+      "statuses_count",
+      "statusesCount",
+      "statuses"
+    ),
+
+    createdAt: stringField(
+      user,
+      "created_at",
+      "createdAt"
+    ),
+
+    verified: booleanField(
+      user,
+      "verified",
+      "isVerified"
+    ),
+
+    id: String(
+      user.id ??
+      user.id_str ??
+      user.rest_id ??
+      ""
+    ),
+  };
+}
+
 function accountAgeDays(createdAt) {
   if (!createdAt) {
     return null;
   }
 
-  const timestamp =
-    new Date(createdAt).getTime();
+  const timestamp = new Date(createdAt).getTime();
 
-  if (Number.isNaN(timestamp)) {
+  if (!Number.isFinite(timestamp)) {
     return null;
   }
 
@@ -95,823 +155,873 @@ function accountAgeDays(createdAt) {
   );
 }
 
-/*
-|--------------------------------------------------------------------------
-| NORMALIZE TWITTER USER
-|--------------------------------------------------------------------------
-*/
+function getFollowingsFromResponse(data) {
+  if (!data) {
+    return [];
+  }
 
-function normalizeUser(user) {
-  const username = stringField(
-    user,
-    "userName",
-    "username",
-    "screen_name"
-  );
+  if (Array.isArray(data.followings)) {
+    return data.followings;
+  }
 
-  const followers = numberField(
-    user,
-    "followers_count",
-    "followersCount",
-    "followers"
-  );
+  if (Array.isArray(data?.data?.followings)) {
+    return data.data.followings;
+  }
 
-  const following = numberField(
-    user,
-    "following_count",
-    "followingCount",
-    "following",
-    "friends_count"
-  );
+  if (Array.isArray(data.data)) {
+    return data.data;
+  }
 
-  const statuses = numberField(
-    user,
-    "tweet_count",
-    "statuses_count",
-    "statusesCount"
-  );
+  if (Array.isArray(data.users)) {
+    return data.users;
+  }
 
-  const createdAt = stringField(
-    user,
-    "created_at",
-    "createdAt"
+  return [];
+}
+
+async function requestFollowings(apiKey, username, pageSize) {
+  const params = new URLSearchParams({
+    userName: username,
+    pageSize: String(pageSize),
+  });
+
+  const url =
+    `${API_BASE}/twitter/user/followings?${params.toString()}`;
+
+  async function makeRequest() {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "X-API-Key": apiKey,
+        Accept: "application/json",
+      },
+    });
+
+    let data = null;
+
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+
+    return {
+      status: response.status,
+      data,
+    };
+  }
+
+  let result = await makeRequest();
+
+  if (result.status === 429) {
+    await sleep(RETRY_DELAY_MS);
+    result = await makeRequest();
+  }
+
+  const followings = getFollowingsFromResponse(
+    result.data
   );
 
   return {
-    username,
-
-    name: stringField(
-      user,
-      "name"
-    ),
-
-    description: stringField(
-      user,
-      "description"
-    ),
-
-    followers,
-    following,
-    statuses,
-    createdAt,
-
-    verified:
-      Boolean(user?.verified),
-
-    id:
-      user?.id ||
-      user?.id_str ||
-      null
+    status: result.status,
+    followings,
+    error:
+      result.status >= 200 &&
+      result.status < 300
+        ? null
+        : result.data?.message ||
+          result.data?.error ||
+          `HTTP ${result.status}`,
   };
 }
 
-function looksInteresting(user) {
-  if (!user.username) {
+// ============================================================
+// UPSTASH REDIS
+// ============================================================
+
+function redisConfigured() {
+  return Boolean(
+    process.env.UPSTASH_REDIS_REST_URL &&
+    process.env.UPSTASH_REDIS_REST_TOKEN
+  );
+}
+
+async function redisCommand(command) {
+  if (!redisConfigured()) {
+    return null;
+  }
+
+  const baseUrl =
+    process.env.UPSTASH_REDIS_REST_URL.replace(
+      /\/$/,
+      ""
+    );
+
+  const response = await fetch(baseUrl, {
+    method: "POST",
+    headers: {
+      Authorization:
+        `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(command),
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Redis HTTP ${response.status}`
+    );
+  }
+
+  const data = await response.json();
+
+  return data?.result ?? null;
+}
+
+async function loadPreviousSnapshot() {
+  if (!redisConfigured()) {
+    return {
+      available: false,
+      snapshot: {},
+      savedAt: null,
+    };
+  }
+
+  try {
+    const result = await redisCommand([
+      "GET",
+      SNAPSHOT_KEY,
+    ]);
+
+    if (!result) {
+      return {
+        available: true,
+        snapshot: {},
+        savedAt: null,
+      };
+    }
+
+    const parsed = JSON.parse(result);
+
+    return {
+      available: true,
+      snapshot:
+        parsed?.accounts &&
+        typeof parsed.accounts === "object"
+          ? parsed.accounts
+          : {},
+      savedAt: parsed?.savedAt || null,
+    };
+  } catch (error) {
+    console.error(
+      "Redis load error:",
+      error.message
+    );
+
+    return {
+      available: false,
+      snapshot: {},
+      savedAt: null,
+    };
+  }
+}
+
+async function saveSnapshot(accounts) {
+  if (!redisConfigured()) {
+    return false;
+  }
+
+  const payload = {
+    savedAt: new Date().toISOString(),
+    accounts,
+  };
+
+  try {
+    await redisCommand([
+      "SET",
+      SNAPSHOT_KEY,
+      JSON.stringify(payload),
+    ]);
+
+    return true;
+  } catch (error) {
+    console.error(
+      "Redis save error:",
+      error.message
+    );
+
+    return false;
+  }
+}
+
+// ============================================================
+// SCORING
+// ============================================================
+
+function calculateSmartScore(account) {
+  let score = 0;
+
+  const age =
+    account.accountAgeDays ?? 99999;
+
+  // Smart followers merupakan sinyal utama.
+  score += account.smartFollowerCount * 15;
+
+  // Akun sangat baru.
+  if (age <= 1) {
+    score += 30;
+  } else if (age <= 3) {
+    score += 24;
+  } else if (age <= 7) {
+    score += 18;
+  } else if (age <= 30) {
+    score += 12;
+  } else if (age <= 90) {
+    score += 7;
+  }
+
+  // Akun kecil / early.
+  if (account.followers <= 100) {
+    score += 12;
+  } else if (account.followers <= 500) {
+    score += 10;
+  } else if (account.followers <= 2000) {
+    score += 7;
+  } else if (account.followers <= 10000) {
+    score += 3;
+  }
+
+  // Akun dengan sedikit tweet bisa berarti project/account baru.
+  if (account.statuses <= 20) {
+    score += 10;
+  } else if (account.statuses <= 100) {
+    score += 6;
+  } else if (account.statuses <= 500) {
+    score += 3;
+  }
+
+  return clamp(
+    Math.round(score),
+    0,
+    100
+  );
+}
+
+function classifyBaseStatus(account) {
+  const age =
+    account.accountAgeDays ?? 99999;
+
+  if (
+    age <= 3 &&
+    account.smartFollowerCount >= 2
+  ) {
+    return {
+      status: "ULTRA EARLY",
+      ultraStatus:
+        "ULTRA EARLY SMART FOLLOW",
+    };
+  }
+
+  if (
+    age <= 7 &&
+    account.smartFollowerCount >= 2
+  ) {
+    return {
+      status: "SMART EARLY",
+      ultraStatus: "SMART EARLY",
+    };
+  }
+
+  if (account.smartFollowerCount >= 2) {
+    return {
+      status: "SMART SIGNAL",
+      ultraStatus: null,
+    };
+  }
+
+  return {
+    status: "WATCH",
+    ultraStatus: null,
+  };
+}
+
+function looksInteresting(account) {
+  if (!account?.username) {
+    return false;
+  }
+
+  const username =
+    account.username.toLowerCase();
+
+  // Jangan masukkan seed sendiri sebagai discovery.
+  if (
+    SMART_SEEDS.some(
+      (seed) =>
+        seed.toLowerCase() === username
+    )
+  ) {
     return false;
   }
 
   return true;
 }
 
-/*
-|--------------------------------------------------------------------------
-| TWITTERAPI.IO
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// HISTORY / CHANGE DETECTION
+// ============================================================
 
-async function getRecentFollowings(
-  apiKey,
-  username,
-  pageSize
+function getPreviousFollowers(
+  previousSnapshot,
+  username
 ) {
-  const url = new URL(API_URL);
+  const previous =
+    previousSnapshot?.[
+      username.toLowerCase()
+    ];
 
-  url.searchParams.set(
-    "userName",
-    username
-  );
-
-  url.searchParams.set(
-    "pageSize",
-    String(pageSize)
-  );
-
-  const response = await fetch(
-    url.toString(),
-    {
-      headers: {
-        "X-API-Key": apiKey,
-        Accept: "application/json"
-      }
-    }
-  );
-
-  let data = null;
-
-  try {
-    data = await response.json();
-  } catch {
-    data = null;
+  if (!previous) {
+    return [];
   }
 
-  if (!response.ok) {
-    return {
-      ok: false,
-      status: response.status,
-
-      error:
-        data?.message ||
-        data?.error ||
-        `HTTP ${response.status}`,
-
-      followings: []
-    };
-  }
-
-  let followings = [];
-
-  if (Array.isArray(data?.followings)) {
-    followings =
-      data.followings;
-  } else if (
-    Array.isArray(data?.data)
-  ) {
-    followings =
-      data.data;
-  } else if (
-    Array.isArray(
-      data?.data?.followings
-    )
-  ) {
-    followings =
-      data.data.followings;
-  }
-
-  return {
-    ok: true,
-    status: response.status,
-    followings
-  };
+  return Array.isArray(
+    previous.smartFollowers
+  )
+    ? previous.smartFollowers
+    : [];
 }
 
-/*
-|--------------------------------------------------------------------------
-| ACCOUNT SCORE
-|--------------------------------------------------------------------------
-*/
-
-function scoreAccount(account) {
-  const ageDays =
-    accountAgeDays(
-      account.createdAt
+function detectChanges(
+  account,
+  previousSnapshot,
+  hasPreviousSnapshot
+) {
+  const previousSmartFollowers =
+    getPreviousFollowers(
+      previousSnapshot,
+      account.username
     );
 
-  /*
-  |--------------------------------------------------------------------------
-  | Base smart-follow score
-  |--------------------------------------------------------------------------
-  */
+  // PENTING:
+  // Scan pertama adalah baseline.
+  // Jangan menganggap semua follower pada scan pertama sebagai "baru".
+  const newSmartFollowers =
+    hasPreviousSnapshot
+      ? account.smartFollowers.filter(
+          (seed) =>
+            !previousSmartFollowers.some(
+              (oldSeed) =>
+                oldSeed.toLowerCase() ===
+                seed.toLowerCase()
+            )
+        )
+      : [];
 
-  let score =
-    account.smartFollowerCount * 15;
+  const newSmartFollowerCount =
+    newSmartFollowers.length;
 
-  /*
-  |--------------------------------------------------------------------------
-  | ULTRA EARLY BOOST
-  |--------------------------------------------------------------------------
-  */
+  let changeStatus = null;
 
-  if (ageDays !== null) {
-    if (ageDays <= 3) {
-      score += 40;
-    } else if (ageDays <= 7) {
-      score += 25;
-    } else if (ageDays <= 30) {
-      score += 15;
-    } else if (ageDays <= 90) {
-      score += 7;
-    }
-  }
-
-  /*
-  |--------------------------------------------------------------------------
-  | Smaller-account early boost
-  |--------------------------------------------------------------------------
-  */
-
-  if (
-    account.followers > 0 &&
-    account.followers < 1000
-  ) {
-    score += 8;
-  } else if (
-    account.followers >= 1000 &&
-    account.followers < 5000
-  ) {
-    score += 4;
-  }
-
-  /*
-  |--------------------------------------------------------------------------
-  | Small verified boost
-  |--------------------------------------------------------------------------
-  */
-
-  if (account.verified) {
-    score += 2;
-  }
-
-  /*
-  |--------------------------------------------------------------------------
-  | SMART STATUS
-  |--------------------------------------------------------------------------
-  */
-
-  let status = "WATCH";
-
-  if (
-    account.smartFollowerCount >= 2
-  ) {
-    status = "SMART SIGNAL";
-  }
-
-  if (
-    account.smartFollowerCount >= 3
-  ) {
-    status = "SMART EARLY";
-  }
-
-  if (
-    account.smartFollowerCount >= 5
-  ) {
-    status = "SMART CLUSTER";
-  }
-
-  /*
-  |--------------------------------------------------------------------------
-  | ULTRA EARLY STATUS
-  |--------------------------------------------------------------------------
-  */
-
-  let ultraStatus = null;
-
-  if (
-    ageDays !== null &&
-    ageDays <= 3
-  ) {
-    ultraStatus =
-      "NEW WATCH";
-
+  if (newSmartFollowerCount > 0) {
     if (
-      account.smartFollowerCount >= 2
+      account.accountAgeDays !== null &&
+      account.accountAgeDays <= 3
     ) {
-      ultraStatus =
-        "NEW SMART SIGNAL";
-    }
-
-    if (
-      account.smartFollowerCount >= 3
-    ) {
-      ultraStatus =
-        "NEW SMART EARLY";
-    }
-
-    if (
-      account.smartFollowerCount >= 5
-    ) {
-      ultraStatus =
-        "NEW SMART CLUSTER";
+      changeStatus =
+        "ULTRA EARLY SMART FOLLOW";
+    } else {
+      changeStatus =
+        "SUDDEN SMART FOLLOW";
     }
   }
 
   return {
-    ...account,
-
-    accountAgeDays:
-      ageDays === null
-        ? null
-        : Number(
-            ageDays.toFixed(2)
-          ),
-
-    smartScore:
-      Number(
-        score.toFixed(2)
-      ),
-
-    status,
-    ultraStatus,
-
-    url:
-      `https://x.com/${account.username}`
+    previousSmartFollowers,
+    newSmartFollowers,
+    newSmartFollowerCount,
+    changeStatus,
   };
 }
 
-/*
-|--------------------------------------------------------------------------
-| MAIN HANDLER
-|--------------------------------------------------------------------------
-*/
+// ============================================================
+// HANDLER
+// ============================================================
 
-module.exports =
-async function handler(req, res) {
+module.exports = async function handler(
+  req,
+  res
+) {
   try {
+    if (req.method !== "GET") {
+      return res.status(405).json({
+        ok: false,
+        error: "Method not allowed",
+      });
+    }
+
     const apiKey =
       process.env.TWITTER_API_KEY;
 
     if (!apiKey) {
-      return res
-        .status(500)
-        .json({
-          ok: false,
-
-          error:
-            "TWITTER_API_KEY missing"
-        });
+      return res.status(500).json({
+        ok: false,
+        error:
+          "TWITTER_API_KEY belum dikonfigurasi.",
+      });
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Page size
-    |--------------------------------------------------------------------------
-    */
+    const size = clamp(
+      Number(req.query.size) || 20,
+      20,
+      200
+    );
 
-    const pageSize =
-      clamp(
-        req.query.size,
-        20,
-        30,
-        20
-      );
+    const totalBatches = Math.ceil(
+      SMART_SEEDS.length / BATCH_SIZE
+    );
 
-    /*
-    |--------------------------------------------------------------------------
-    | Batch selection
-    |--------------------------------------------------------------------------
-    |
-    | batch=1
-    | 0xngmi
-    | DefiIgnas
-    | Route2FI
-    |
-    | batch=2
-    | Dynamo_Patrick
-    | TheDeFinvestor
-    | blocmatesdotcom
-    |
-    */
-
-    const maxBatch =
-      Math.ceil(
-        SMART_SEEDS.length /
-        SEEDS_PER_BATCH
-      );
-
-    const requestedBatch =
-      clamp(
-        req.query.batch,
-        1,
-        maxBatch,
-        1
-      );
+    const requestedBatch = clamp(
+      Number(req.query.batch) || 1,
+      1,
+      totalBatches
+    );
 
     const startIndex =
       (requestedBatch - 1) *
-      SEEDS_PER_BATCH;
+      BATCH_SIZE;
 
-    const activeSeeds =
-      SMART_SEEDS.slice(
-        startIndex,
-        startIndex +
-          SEEDS_PER_BATCH
-      );
+    const seeds = SMART_SEEDS.slice(
+      startIndex,
+      startIndex + BATCH_SIZE
+    );
 
-    const graph =
-      new Map();
+    // Ambil snapshot SEBELUM scan baru.
+    const previousState =
+      await loadPreviousSnapshot();
 
+    const previousSnapshot =
+      previousState.snapshot || {};
+
+    // Snapshot dianggap benar-benar punya history
+    // kalau sudah pernah disimpan sebelumnya.
+    const hasPreviousSnapshot =
+      Boolean(previousState.savedAt);
+
+    const graph = new Map();
     const seedStats = [];
-
-    /*
-    |--------------------------------------------------------------------------
-    | SCAN ACTIVE SMART ACCOUNTS
-    |--------------------------------------------------------------------------
-    */
 
     for (
       let i = 0;
-      i < activeSeeds.length;
+      i < seeds.length;
       i++
     ) {
-      const seed =
-        activeSeeds[i];
+      const seed = seeds[i];
 
-      let result =
-        await getRecentFollowings(
-          apiKey,
-          seed,
-          pageSize
+      if (i > 0) {
+        await sleep(
+          REQUEST_DELAY_MS
         );
+      }
 
-      /*
-      |--------------------------------------------------------------------------
-      | Rate-limit retry
-      |--------------------------------------------------------------------------
-      */
+      let result;
 
-      if (
-        result.status === 429
-      ) {
-        await sleep(5200);
-
+      try {
         result =
-          await getRecentFollowings(
+          await requestFollowings(
             apiKey,
             seed,
-            pageSize
+            size
           );
+      } catch (error) {
+        seedStats.push({
+          seed,
+          status: 0,
+          found: 0,
+          error: error.message,
+        });
+
+        continue;
       }
 
       seedStats.push({
         seed,
-
-        status:
-          result.status,
-
+        status: result.status,
         found:
           result.followings.length,
-
-        error:
-          result.error || null
+        error: result.error,
       });
 
-      /*
-      |--------------------------------------------------------------------------
-      | Build graph
-      |--------------------------------------------------------------------------
-      */
-
-      if (result.ok) {
-        for (
-          const rawUser of
-          result.followings
-        ) {
-          const user =
-            normalizeUser(
-              rawUser
-            );
-
-          if (
-            !looksInteresting(
-              user
-            )
-          ) {
-            continue;
-          }
-
-          const key =
-            user.username
-              .toLowerCase();
-
-          if (
-            !graph.has(key)
-          ) {
-            graph.set(
-              key,
-              {
-                username:
-                  user.username,
-
-                name:
-                  user.name,
-
-                description:
-                  user.description,
-
-                followers:
-                  user.followers,
-
-                following:
-                  user.following,
-
-                statuses:
-                  user.statuses,
-
-                createdAt:
-                  user.createdAt,
-
-                verified:
-                  user.verified,
-
-                id:
-                  user.id,
-
-                smartFollowers:
-                  [],
-
-                smartFollowerCount:
-                  0
-              }
-            );
-          }
-
-          const account =
-            graph.get(key);
-
-          if (
-            !account
-              .smartFollowers
-              .includes(seed)
-          ) {
-            account
-              .smartFollowers
-              .push(seed);
-
-            account
-              .smartFollowerCount =
-                account
-                  .smartFollowers
-                  .length;
-          }
-        }
+      if (
+        result.status < 200 ||
+        result.status >= 300
+      ) {
+        continue;
       }
 
-      /*
-      |--------------------------------------------------------------------------
-      | Protect API QPS
-      |--------------------------------------------------------------------------
-      */
-
-      if (
-        i <
-        activeSeeds.length - 1
+      for (
+        const raw of
+        result.followings
       ) {
-        await sleep(5200);
+        const user =
+          normalizeUser(raw);
+
+        if (
+          !user ||
+          !looksInteresting(user)
+        ) {
+          continue;
+        }
+
+        const key =
+          user.username.toLowerCase();
+
+        if (!graph.has(key)) {
+          graph.set(key, {
+            ...user,
+            smartFollowers: [],
+          });
+        }
+
+        const account =
+          graph.get(key);
+
+        if (
+          !account.smartFollowers.includes(
+            seed
+          )
+        ) {
+          account.smartFollowers.push(
+            seed
+          );
+        }
       }
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | SCORE EVERYTHING
-    |--------------------------------------------------------------------------
-    */
-
-    const accounts =
-      Array.from(
-        graph.values()
-      )
-        .map(
-          scoreAccount
-        )
-
-        .sort(
-          (a, b) => {
-            /*
-             * Ultra Early first.
-             */
-
-            const aUltra =
-              a.ultraStatus
-                ? 1
-                : 0;
-
-            const bUltra =
-              b.ultraStatus
-                ? 1
-                : 0;
-
-            if (
-              bUltra !==
-              aUltra
-            ) {
-              return (
-                bUltra -
-                aUltra
-              );
-            }
-
-            /*
-             * More smart followers.
-             */
-
-            if (
-              b.smartFollowerCount !==
-              a.smartFollowerCount
-            ) {
-              return (
-                b.smartFollowerCount -
-                a.smartFollowerCount
-              );
-            }
-
-            /*
-             * Higher score.
-             */
-
-            return (
-              b.smartScore -
-              a.smartScore
-            );
-          }
+    let accounts = Array.from(
+      graph.values()
+    ).map((account) => {
+      const age =
+        accountAgeDays(
+          account.createdAt
         );
 
-    /*
-    |--------------------------------------------------------------------------
-    | ULTRA EARLY
-    |--------------------------------------------------------------------------
-    |
-    | Account <= 3 days old
-    | AND followed by >= 1 smart account.
-    |
-    */
+      const smartFollowerCount =
+        account.smartFollowers.length;
+
+      let enriched = {
+        ...account,
+        smartFollowerCount,
+        accountAgeDays:
+          age === null
+            ? null
+            : Number(
+                age.toFixed(2)
+              ),
+      };
+
+      const score =
+        calculateSmartScore(
+          enriched
+        );
+
+      const baseStatus =
+        classifyBaseStatus(
+          enriched
+        );
+
+      enriched = {
+        ...enriched,
+        smartScore: score,
+        status:
+          baseStatus.status,
+        ultraStatus:
+          baseStatus.ultraStatus,
+        url:
+          `https://x.com/${enriched.username}`,
+      };
+
+      const changes =
+        detectChanges(
+          enriched,
+          previousSnapshot,
+          hasPreviousSnapshot
+        );
+
+      // Sudden follow mendapat bonus score.
+      let finalScore =
+        enriched.smartScore;
+
+      if (
+        changes.newSmartFollowerCount >
+        0
+      ) {
+        finalScore +=
+          changes.newSmartFollowerCount *
+          20;
+      }
+
+      if (
+        changes.changeStatus ===
+        "ULTRA EARLY SMART FOLLOW"
+      ) {
+        finalScore += 20;
+      }
+
+      finalScore = clamp(
+        finalScore,
+        0,
+        100
+      );
+
+      let finalStatus =
+        enriched.status;
+
+      let finalUltraStatus =
+        enriched.ultraStatus;
+
+      if (
+        changes.changeStatus ===
+        "SUDDEN SMART FOLLOW"
+      ) {
+        finalStatus =
+          "SUDDEN SMART FOLLOW";
+      }
+
+      if (
+        changes.changeStatus ===
+        "ULTRA EARLY SMART FOLLOW"
+      ) {
+        finalStatus =
+          "ULTRA EARLY";
+        finalUltraStatus =
+          "ULTRA EARLY SMART FOLLOW";
+      }
+
+      return {
+        ...enriched,
+        smartScore: finalScore,
+        status: finalStatus,
+        ultraStatus:
+          finalUltraStatus,
+
+        previousSmartFollowers:
+          changes.previousSmartFollowers,
+
+        newSmartFollowers:
+          changes.newSmartFollowers,
+
+        newSmartFollowerCount:
+          changes.newSmartFollowerCount,
+
+        changeStatus:
+          changes.changeStatus,
+      };
+    });
+
+    accounts.sort((a, b) => {
+      // Perubahan terbaru paling atas.
+      if (
+        b.newSmartFollowerCount !==
+        a.newSmartFollowerCount
+      ) {
+        return (
+          b.newSmartFollowerCount -
+          a.newSmartFollowerCount
+        );
+      }
+
+      if (
+        b.smartFollowerCount !==
+        a.smartFollowerCount
+      ) {
+        return (
+          b.smartFollowerCount -
+          a.smartFollowerCount
+        );
+      }
+
+      return (
+        b.smartScore -
+        a.smartScore
+      );
+    });
 
     const ultraEarly =
-      accounts
-        .filter(
-          (account) =>
-            account
-              .accountAgeDays !==
-              null &&
-            account
-              .accountAgeDays <=
-              3 &&
-            account
-              .smartFollowerCount >=
-              1
-        )
-        .slice(0, 30);
+      accounts.filter(
+        (account) =>
+          account.ultraStatus ===
+          "ULTRA EARLY SMART FOLLOW"
+      );
 
-    /*
-    |--------------------------------------------------------------------------
-    | SMART CANDIDATES
-    |--------------------------------------------------------------------------
-    |
-    | Followed by >= 2 smart accounts.
-    |
-    */
+    const suddenSmartFollows =
+      accounts.filter(
+        (account) =>
+          account.changeStatus ===
+            "SUDDEN SMART FOLLOW" ||
+          account.changeStatus ===
+            "ULTRA EARLY SMART FOLLOW"
+      );
 
     const candidates =
-      accounts
-        .filter(
-          (account) =>
-            account
-              .smartFollowerCount >=
-              2
-        )
-        .slice(0, 30);
-
-    /*
-    |--------------------------------------------------------------------------
-    | DISCOVERIES
-    |--------------------------------------------------------------------------
-    |
-    | Followed by exactly one smart account.
-    |
-    */
+      accounts.filter(
+        (account) =>
+          account.smartFollowerCount >=
+          2
+      );
 
     const discoveries =
       accounts
         .filter(
           (account) =>
-            account
-              .smartFollowerCount ===
-              1
+            account.smartFollowerCount >=
+            1
         )
-        .slice(0, 30);
-
-    /*
-    |--------------------------------------------------------------------------
-    | ALERT CANDIDATES
-    |--------------------------------------------------------------------------
-    |
-    | Prepared for Telegram.
-    |
-    | Priority:
-    | 1. Ultra Early <= 3 days
-    | 2. Multiple smart followers
-    |
-    */
+        .slice(0, 50);
 
     const alertCandidates =
-      accounts
-        .filter(
-          (account) =>
-            account.ultraStatus ||
-            account
-              .smartFollowerCount >=
-              2
-        )
-        .slice(0, 20);
+      accounts.filter(
+        (account) =>
+          account.newSmartFollowerCount >
+            0 ||
+          account.smartFollowerCount >=
+            2
+      );
 
-    /*
-    |--------------------------------------------------------------------------
-    | Next batch
-    |--------------------------------------------------------------------------
-    */
+    // ========================================================
+    // MERGE SNAPSHOT
+    //
+    // Karena endpoint menggunakan batch,
+    // jangan hapus data batch lain.
+    // Kita merge hasil scan ini ke snapshot lama.
+    // ========================================================
+
+    const nextSnapshot = {
+      ...previousSnapshot,
+    };
+
+    for (const account of accounts) {
+      nextSnapshot[
+        account.username.toLowerCase()
+      ] = {
+        username:
+          account.username,
+        smartFollowers:
+          account.smartFollowers,
+        smartFollowerCount:
+          account.smartFollowerCount,
+        followers:
+          account.followers,
+        accountAgeDays:
+          account.accountAgeDays,
+        lastSeenAt:
+          new Date().toISOString(),
+      };
+    }
+
+    const snapshotSaved =
+      await saveSnapshot(
+        nextSnapshot
+      );
 
     const nextBatch =
       requestedBatch >=
-      maxBatch
+      totalBatches
         ? 1
         : requestedBatch + 1;
 
-    /*
-    |--------------------------------------------------------------------------
-    | RESPONSE
-    |--------------------------------------------------------------------------
-    */
+    return res.status(200).json({
+      ok: true,
 
-    return res
-      .status(200)
-      .json({
-        ok: true,
+      mode:
+        "smart-graph-ultra-early-memory",
 
-        mode:
-          "smart-graph-ultra-early",
+      version: "2.0-final",
 
-        version:
-          "1.0-final",
+      batch:
+        requestedBatch,
 
-        batch:
-          requestedBatch,
+      totalBatches,
 
-        totalBatches:
-          maxBatch,
+      nextBatch,
 
-        nextBatch,
+      seedsScanned: seeds,
 
-        seedsScanned:
-          activeSeeds,
+      recentFollowingsPerSeed:
+        size,
 
-        recentFollowingsPerSeed:
-          pageSize,
+      uniqueAccountsScanned:
+        accounts.length,
 
-        uniqueAccountsScanned:
-          graph.size,
+      // Memory info
+      memory: {
+        configured:
+          redisConfigured(),
 
-        /*
-        |--------------------------------------------------------------------------
-        | Ultra Early
-        |--------------------------------------------------------------------------
-        */
+        previousSnapshotExists:
+          hasPreviousSnapshot,
 
-        ultraEarlyCount:
-          ultraEarly.length,
+        previousSnapshotSavedAt:
+          previousState.savedAt,
 
-        ultraEarly,
+        snapshotSaved,
+      },
 
-        /*
-        |--------------------------------------------------------------------------
-        | Smart overlap
-        |--------------------------------------------------------------------------
-        */
+      // Akun muda + smart signal
+      ultraEarlyCount:
+        ultraEarly.length,
 
-        smartCandidates:
-          candidates.length,
+      ultraEarly:
+        ultraEarly.slice(0, 20),
 
-        candidates,
+      // Yang paling penting:
+      // smart follower BARU sejak scan sebelumnya.
+      suddenSmartFollowCount:
+        suddenSmartFollows.length,
 
-        /*
-        |--------------------------------------------------------------------------
-        | Single smart-follow discoveries
-        |--------------------------------------------------------------------------
-        */
+      suddenSmartFollows:
+        suddenSmartFollows.slice(
+          0,
+          20
+        ),
 
-        discoveriesCount:
-          discoveries.length,
+      smartCandidates:
+        candidates.length,
 
-        discoveries,
+      candidates:
+        candidates.slice(0, 30),
 
-        /*
-        |--------------------------------------------------------------------------
-        | Telegram-ready candidates
-        |--------------------------------------------------------------------------
-        */
+      discoveriesCount:
+        discoveries.length,
 
-        alertCandidatesCount:
-          alertCandidates.length,
+      discoveries,
 
-        alertCandidates,
+      alertCandidatesCount:
+        alertCandidates.length,
 
-        /*
-        |--------------------------------------------------------------------------
-        | Diagnostics
-        |--------------------------------------------------------------------------
-        */
+      alertCandidates:
+        alertCandidates.slice(
+          0,
+          30
+        ),
 
-        seedStats
-      });
-
+      seedStats,
+    });
   } catch (error) {
-    return res
-      .status(500)
-      .json({
-        ok: false,
+    console.error(
+      "Smart Graph fatal error:",
+      error
+    );
 
-        mode:
-          "smart-graph-ultra-early",
+    return res.status(500).json({
+      ok: false,
 
-        error:
-          String(error)
-      });
+      mode:
+        "smart-graph-ultra-early-memory",
+
+      version: "2.0-final",
+
+      error:
+        error.message ||
+        "Unknown error",
+    });
   }
 };
