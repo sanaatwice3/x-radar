@@ -1,82 +1,78 @@
-const BASE_URL =
+const API_URL =
   "https://api.twitterapi.io/twitter/tweet/advanced_search";
 
-function clamp(n, min, max) {
-  return Math.min(Math.max(n, min), max);
+export default async function handler(req, res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Cache-Control", "no-store");
+
+  if (req.method !== "GET") {
+    return res.status(405).json({ error: "GET only" });
+  }
+
+  const apiKey = process.env.TWITTER_API_KEY;
+  const q = String(req.query.q || "").trim();
+  const minutes = Math.min(
+    Math.max(Number(req.query.minutes) || 60, 1),
+    10080
+  );
+
+  if (!apiKey) {
+    return res.status(500).json({
+      error: "TWITTER_API_KEY is not configured",
+    });
+  }
+
+  if (!q) {
+    return res.status(400).json({
+      error: "Missing q",
+    });
+  }
+
+  try {
+    const sinceTime =
+      Math.floor(Date.now() / 1000) -
+      minutes * 60;
+
+    const searchQuery =
+      `${q} since_time:${sinceTime}`;
+
+    const url = new URL(API_URL);
+    url.searchParams.set("query", searchQuery);
+    url.searchParams.set("queryType", "Latest");
+
+    const response = await fetch(url, {
+      headers: {
+        "X-API-Key": apiKey,
+      },
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      return res.status(response.status).json({
+        error: "TwitterAPI.io error",
+        details: data,
+      });
+    }
+
+    const tweets =
+      data.tweets ||
+      data.data?.tweets ||
+      [];
+
+    return res.status(200).json({
+      ok: true,
+      query: q,
+      minutes,
+      fetchedAt: new Date().toISOString(),
+      count: Array.isArray(tweets)
+        ? tweets.length
+        : 0,
+      tweets,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: error.message,
+    });
+  }
 }
-
-function getTweetTime(tweet) {
-  const raw =
-    tweet.createdAt ||
-    tweet.created_at ||
-    tweet.createdTime ||
-    tweet.created_time;
-
-  const time = raw ? Date.parse(raw) : NaN;
-  return Number.isFinite(time) ? time : null;
-}
-
-function normalizeTweet(tweet) {
-  const author = tweet.author || tweet.user || {};
-
-  const username =
-    author.userName ||
-    author.username ||
-    tweet.userName ||
-    tweet.username ||
-    null;
-
-  const id =
-    tweet.id ||
-    tweet.tweetId ||
-    tweet.tweet_id ||
-    null;
-
-  return {
-    id,
-    text:
-      tweet.text ||
-      tweet.fullText ||
-      tweet.full_text ||
-      "",
-
-    createdAt:
-      tweet.createdAt ||
-      tweet.created_at ||
-      tweet.createdTime ||
-      tweet.created_time ||
-      null,
-
-    author: {
-      username,
-      name: author.name || tweet.authorName || null,
-      followers:
-        author.followers ??
-        author.followersCount ??
-        author.followers_count ??
-        null,
-    },
-
-    engagement: {
-      likes:
-        tweet.likeCount ??
-        tweet.likes ??
-        tweet.favorite_count ??
-        0,
-
-      retweets:
-        tweet.retweetCount ??
-        tweet.retweets ??
-        tweet.retweet_count ??
-        0,
-
-      replies:
-        tweet.replyCount ??
-        tweet.replies ??
-        tweet.reply_count ??
-        0,
-
-      quotes:
-        tweet.quoteCount ??
-        tweet.quotes ??
-        tweet
