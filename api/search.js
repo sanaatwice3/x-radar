@@ -1,7 +1,7 @@
 const API_URL =
   "https://api.twitterapi.io/twitter/tweet/advanced_search";
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Cache-Control", "no-store");
 
@@ -11,7 +11,6 @@ export default async function handler(req, res) {
 
   const apiKey = process.env.TWITTER_API_KEY;
   const q = String(req.query.q || "").trim();
-
   const minutes = Math.min(
     Math.max(Number(req.query.minutes) || 60, 1),
     10080
@@ -19,13 +18,13 @@ export default async function handler(req, res) {
 
   if (!apiKey) {
     return res.status(500).json({
-      error: "TWITTER_API_KEY is not configured",
+      error: "TWITTER_API_KEY is not configured"
     });
   }
 
   if (!q) {
     return res.status(400).json({
-      error: "Missing q",
+      error: "Missing q"
     });
   }
 
@@ -33,20 +32,51 @@ export default async function handler(req, res) {
     const sinceTime =
       Math.floor(Date.now() / 1000) - minutes * 60;
 
-    const searchQuery =
-      `${q} since_time:${sinceTime}`;
-
     const url = new URL(API_URL);
 
-    url.searchParams.set("query", searchQuery);
-    url.searchParams.set("queryType", "Latest");
+    url.searchParams.set(
+      "query",
+      `${q} since_time:${sinceTime}`
+    );
+
+    url.searchParams.set(
+      "queryType",
+      "Latest"
+    );
 
     const response = await fetch(url, {
       headers: {
-        "X-API-Key": apiKey,
-      },
+        "X-API-Key": apiKey
+      }
     });
 
     const data = await response.json();
 
     if (!response.ok) {
+      return res.status(response.status).json({
+        error: "TwitterAPI.io error",
+        details: data
+      });
+    }
+
+    const tweets =
+      data.tweets ||
+      data.data?.tweets ||
+      [];
+
+    return res.status(200).json({
+      ok: true,
+      query: q,
+      minutes,
+      count: Array.isArray(tweets)
+        ? tweets.length
+        : 0,
+      tweets
+    });
+
+  } catch (error) {
+    return res.status(500).json({
+      error: error.message
+    });
+  }
+};
