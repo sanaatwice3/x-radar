@@ -1,16 +1,5 @@
 const API_URL = "https://api.twitterapi.io/twitter/user/followings";
 
-/*
-|--------------------------------------------------------------------------
-| SMART GRAPH V1
-|--------------------------------------------------------------------------
-| Mesin tambahan untuk mendeteksi account/project yang mulai di-follow
-| oleh beberapa smart account.
-|
-| Narrative Radar v4 TIDAK disentuh.
-|--------------------------------------------------------------------------
-*/
-
 const SMART_SEEDS = [
   "0xngmi",
   "DefiIgnas",
@@ -49,24 +38,19 @@ function accountAgeDays(createdAt) {
 }
 
 function looksInteresting(user) {
-  if (!user?.userName) {
-    return false;
-  }
+  if (!user?.userName) return false;
+
+  if (user.unavailable) return false;
 
   const followers = Number(user.followers) || 0;
   const following = Number(user.following) || 0;
   const statuses = Number(user.statusesCount) || 0;
 
-  // Buang akun kosong / unavailable.
   if (
     followers === 0 &&
     following === 0 &&
     statuses === 0
   ) {
-    return false;
-  }
-
-  if (user.unavailable) {
     return false;
   }
 
@@ -130,34 +114,39 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Default 20 recent followings per smart account.
-    | Sengaja kecil supaya lebih hemat credit.
-    |--------------------------------------------------------------------------
-    */
-
     const pageSize = clamp(
       req.query.size,
       20,
-      50,
+      30,
       20
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | BATCH MODE
+    |--------------------------------------------------------------------------
+    |
+    | batch=1 -> seed 1,2,3
+    | batch=2 -> seed 4,5,6
+    |
+    */
+
+    const requestedBatch =
+      Number(req.query.batch) === 2 ? 2 : 1;
+
+    const startIndex =
+      requestedBatch === 1 ? 0 : 3;
+
+    const activeSeeds = SMART_SEEDS.slice(
+      startIndex,
+      startIndex + 3
     );
 
     const graph = new Map();
     const seedStats = [];
 
-    /*
-    |--------------------------------------------------------------------------
-    | FETCH SEQUENTIAL
-    |--------------------------------------------------------------------------
-    | Jangan Promise.all karena account TwitterAPI.io kita sebelumnya
-    | kena rate limit kalau request paralel.
-    |--------------------------------------------------------------------------
-    */
-
-    for (let i = 0; i < SMART_SEEDS.length; i++) {
-      const seed = SMART_SEEDS[i];
+    for (let i = 0; i < activeSeeds.length; i++) {
+      const seed = activeSeeds[i];
 
       let result = await getRecentFollowings(
         apiKey,
@@ -165,9 +154,8 @@ module.exports = async function handler(req, res) {
         pageSize
       );
 
-      // Retry kalau kena rate limit.
       if (result.status === 429) {
-        await sleep(5500);
+        await sleep(5200);
 
         result = await getRecentFollowings(
           apiKey,
@@ -226,29 +214,26 @@ module.exports = async function handler(req, res) {
         }
       }
 
-      // Delay antar smart account.
-      if (i < SMART_SEEDS.length - 1) {
+      /*
+      |--------------------------------------------------------------------------
+      | Hanya dua delay maksimal per request.
+      |--------------------------------------------------------------------------
+      */
+
+      if (i < activeSeeds.length - 1) {
         await sleep(5200);
       }
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | SCORE
-    |--------------------------------------------------------------------------
-    */
-
-    const candidates = Array.from(graph.values())
+    const accounts = Array.from(graph.values())
       .map((account) => {
         const ageDays = accountAgeDays(
           account.createdAt
         );
 
-        // Overlap smart followers = sinyal utama.
         let score =
           account.smartFollowerCount * 15;
 
-        // Account baru dapat boost.
         if (ageDays !== null) {
           if (ageDays <= 7) {
             score += 25;
@@ -259,7 +244,6 @@ module.exports = async function handler(req, res) {
           }
         }
 
-        // Account/project yang masih kecil dapat sedikit early boost.
         if (account.followers < 1000) {
           score += 8;
         } else if (account.followers < 5000) {
@@ -276,10 +260,6 @@ module.exports = async function handler(req, res) {
           status = "SMART EARLY";
         }
 
-        if (account.smartFollowerCount >= 5) {
-          status = "SMART CLUSTER";
-        }
-
         return {
           ...account,
 
@@ -288,37 +268,58 @@ module.exports = async function handler(req, res) {
               ? null
               : Number(ageDays.toFixed(1)),
 
-          smartScore: Number(score.toFixed(2)),
+          smartScore:
+            Number(score.toFixed(2)),
 
           status,
 
-          url: `https://x.com/${account.username}`
+          url:
+            `https://x.com/${account.username}`
         };
       })
+      .sort(
+        (a, b) =>
+          b.smartScore - a.smartScore
+      );
 
-      /*
-      |--------------------------------------------------------------------------
-      | Kandidat harus di-follow minimal 2 seed.
-      |--------------------------------------------------------------------------
-      */
+    /*
+    |--------------------------------------------------------------------------
+    | Kandidat overlap.
+    |--------------------------------------------------------------------------
+    */
 
+    const candidates = accounts
       .filter(
         (account) =>
           account.smartFollowerCount >= 2
       )
+      .slice(0, 30);
 
-      .sort(
-        (a, b) =>
-          b.smartScore - a.smartScore
+    /*
+    |--------------------------------------------------------------------------
+    | Early discoveries.
+    |--------------------------------------------------------------------------
+    |
+    | Walau baru di-follow 1 smart account,
+    | tetap tampil supaya nanti Telegram bisa track.
+    |--------------------------------------------------------------------------
+    */
+
+    const discoveries = accounts
+      .filter(
+        (account) =>
+          account.smartFollowerCount === 1
       )
-
       .slice(0, 30);
 
     return res.status(200).json({
       ok: true,
-      mode: "smart-graph-v1",
 
-      seeds: SMART_SEEDS.length,
+      mode: "smart-graph-fast",
+
+      batch: requestedBatch,
+
+      seedsScanned: activeSeeds,
 
       recentFollowingsPerSeed:
         pageSize,
@@ -329,14 +330,22 @@ module.exports = async function handler(req, res) {
       smartCandidates:
         candidates.length,
 
+      discoveriesCount:
+        discoveries.length,
+
       candidates,
 
-      seedStats
+      discoveries,
+
+      seedStats,
+
+      nextBatch:
+        requestedBatch === 1 ? 2 : 1
     });
   } catch (error) {
     return res.status(500).json({
       ok: false,
-      mode: "smart-graph-v1",
+      mode: "smart-graph-fast",
       error: String(error)
     });
   }
