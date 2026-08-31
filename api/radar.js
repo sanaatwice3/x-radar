@@ -1,62 +1,172 @@
 const API_URL =
   "https://api.twitterapi.io/twitter/tweet/advanced_search";
 
+/*
+|--------------------------------------------------------------------------
+| CONFIG
+|--------------------------------------------------------------------------
+*/
+
 const STOP_WORDS = new Set([
-  "this","that","with","from","have","will","your","what","when","where",
-  "about","they","their","there","would","could","should","just","been",
-  "into","more","than","some","very","here","were","them","then","also",
-  "only","over","after","before","because","while","really","still",
-  "going","make","made","today","right","people","thing","things","like",
-  "said","says","saying","breaking","viral","trending","news","update",
-  "thread","watch","look","https","http","the","and","for","are","was",
-  "you","but","not","all","can","out","has","had","its","our","who",
-  "how","why","now","new","get","got","one","two","too"
+  "this", "that", "with", "from", "have", "will", "your",
+  "what", "when", "where", "about", "they", "their", "there",
+  "would", "could", "should", "just", "been", "into", "more",
+  "than", "some", "very", "here", "were", "them", "then",
+  "also", "only", "over", "after", "before", "because", "while",
+  "really", "still", "going", "make", "made", "today", "right",
+  "people", "thing", "things", "like", "said", "says", "saying",
+  "breaking", "viral", "trending", "news", "update", "thread",
+  "watch", "look", "https", "http", "the", "and", "for", "are",
+  "was", "you", "but", "not", "all", "can", "out", "has",
+  "had", "its", "our", "who", "how", "why", "now", "new",
+  "get", "got", "one", "two", "too", "official", "latest"
 ]);
 
-const BLOCKED = [
+const BLOCKED_PHRASES = [
   "join telegram",
   "telegram group",
   "signal group",
   "private alpha",
-  "contract address",
   "drop your wallet",
   "send wallet",
   "presale",
   "100x",
   "1000x",
   "buy now",
-  "dm me",
-  "stay locked in"
+  "dm me for",
+  "guaranteed profit",
+  "entry now",
+  "easy 10x",
+  "gem call"
 ];
 
+/*
+|--------------------------------------------------------------------------
+| BROAD DISCOVERY SENSORS
+|
+| Sengaja cuma 4 sensor besar.
+| Jangan 12 request bersamaan lagi.
+|--------------------------------------------------------------------------
+*/
+
 const SENSORS = [
-  "breaking OR confirmed OR announced OR launch",
-  "viral OR trending OR controversy OR scandal OR drama",
-  "meme OR funny OR weird OR absurd OR insane",
-  "crypto OR blockchain OR web3 OR nft OR defi OR stablecoin",
-  "mainnet OR testnet OR protocol OR network OR chain OR rollup",
-  "listing OR partnership OR acquisition OR funding OR investment",
-  "exchange OR wallet OR dex OR bridge OR prediction market",
-  "AI OR OpenAI OR technology OR robot OR startup",
-  "CEO OR founder OR president OR politician OR government",
-  "celebrity OR streamer OR gaming OR sports",
-  "market OR stock OR ETF OR treasury OR institutional",
-  "Elon OR Musk OR Trump OR Robinhood OR Coinbase OR Binance"
+  {
+    id: "breaking",
+    query:
+      "breaking OR confirmed OR announced OR launch OR launched OR mainnet OR listing OR partnership OR acquisition"
+  },
+
+  {
+    id: "social",
+    query:
+      "viral OR trending OR meme OR controversy OR scandal OR drama OR celebrity OR streamer"
+  },
+
+  {
+    id: "crypto-tech",
+    query:
+      "crypto OR blockchain OR web3 OR nft OR defi OR stablecoin OR AI OR technology OR startup"
+  },
+
+  {
+    id: "world-markets",
+    query:
+      "CEO OR founder OR president OR government OR market OR stock OR ETF OR gaming OR sports"
+  }
 ];
+
+/*
+|--------------------------------------------------------------------------
+| HELPERS
+|--------------------------------------------------------------------------
+*/
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function clamp(value, min, max, fallback) {
   const n = Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(Math.max(n, min), max);
+
+  if (!Number.isFinite(n)) {
+    return fallback;
+  }
+
+  return Math.min(
+    Math.max(n, min),
+    max
+  );
 }
 
-function tweetArray(data) {
-  if (Array.isArray(data?.tweets)) return data.tweets;
-  if (Array.isArray(data?.data?.tweets)) return data.data.tweets;
+function getTweetsFromResponse(data) {
+  if (Array.isArray(data?.tweets)) {
+    return data.tweets;
+  }
+
+  if (Array.isArray(data?.data?.tweets)) {
+    return data.data.tweets;
+  }
+
+  if (Array.isArray(data?.data)) {
+    return data.data;
+  }
+
   return [];
 }
 
-async function getPage(apiKey, query, since, cursor) {
+function getNextCursor(data) {
+  return (
+    data?.next_cursor ||
+    data?.nextCursor ||
+    data?.cursor?.next ||
+    data?.data?.next_cursor ||
+    data?.data?.nextCursor ||
+    null
+  );
+}
+
+function cleanText(text = "") {
+  return String(text)
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getUsername(tweet) {
+  const author =
+    tweet?.author ||
+    tweet?.user ||
+    {};
+
+  return (
+    author?.userName ||
+    author?.username ||
+    tweet?.userName ||
+    tweet?.username ||
+    ""
+  );
+}
+
+function getCreatedAt(tweet) {
+  return (
+    tweet?.createdAt ||
+    tweet?.created_at ||
+    null
+  );
+}
+
+/*
+|--------------------------------------------------------------------------
+| TWITTER API
+|--------------------------------------------------------------------------
+*/
+
+async function requestSearchPage(
+  apiKey,
+  query,
+  since,
+  cursor = null
+) {
   const url = new URL(API_URL);
 
   url.searchParams.set(
@@ -64,119 +174,228 @@ async function getPage(apiKey, query, since, cursor) {
     `${query} since_time:${since}`
   );
 
-  url.searchParams.set("queryType", "Latest");
+  url.searchParams.set(
+    "queryType",
+    "Latest"
+  );
 
   if (cursor) {
-    url.searchParams.set("cursor", cursor);
+    url.searchParams.set(
+      "cursor",
+      cursor
+    );
   }
 
-  const response = await fetch(url, {
-    headers: {
-      "X-API-Key": apiKey
-    }
-  });
+  let response;
 
-  if (!response.ok) {
+  try {
+    response = await fetch(
+      url.toString(),
+      {
+        method: "GET",
+
+        headers: {
+          "X-API-Key": apiKey,
+          "Accept": "application/json"
+        }
+      }
+    );
+  } catch (error) {
     return {
+      ok: false,
+      status: 0,
+      error: String(error),
       tweets: [],
-      nextCursor: null,
-      hasNext: false,
-      status: response.status
+      nextCursor: null
     };
   }
 
-  const data = await response.json();
+  let data = null;
+
+  try {
+    data = await response.json();
+  } catch {
+    data = null;
+  }
 
   return {
-    tweets: tweetArray(data),
+    ok: response.ok,
+
+    status:
+      response.status,
+
+    error:
+      response.ok
+        ? null
+        : (
+            data?.message ||
+            data?.error ||
+            `HTTP ${response.status}`
+          ),
+
+    tweets:
+      getTweetsFromResponse(data),
 
     nextCursor:
-      data?.next_cursor ||
-      data?.nextCursor ||
-      null,
-
-    hasNext:
-      data?.has_next_page ??
-      data?.hasNextPage ??
-      Boolean(
-        data?.next_cursor ||
-        data?.nextCursor
-      ),
-
-    status: response.status
+      getNextCursor(data)
   };
 }
 
+/*
+|--------------------------------------------------------------------------
+| SENSOR COLLECTION
+|--------------------------------------------------------------------------
+*/
+
 async function collectSensor(
   apiKey,
-  query,
+  sensor,
   since,
   maxPages
 ) {
-  const tweets = [];
+  const collected = [];
   const seen = new Set();
+
+  const statuses = [];
 
   let cursor = null;
   let pagesFetched = 0;
+  let rateLimited = false;
+  let lastError = null;
 
   for (
-    let pageNumber = 0;
-    pageNumber < maxPages;
-    pageNumber++
+    let pageIndex = 0;
+    pageIndex < maxPages;
+    pageIndex++
   ) {
-    const page = await getPage(
-      apiKey,
-      query,
-      since,
-      cursor
+    let result =
+      await requestSearchPage(
+        apiKey,
+        sensor.query,
+        since,
+        cursor
+      );
+
+    /*
+    |--------------------------------------------------------------------------
+    | 429 RETRY
+    |--------------------------------------------------------------------------
+    */
+
+    if (result.status === 429) {
+      rateLimited = true;
+
+      await sleep(5500);
+
+      result =
+        await requestSearchPage(
+          apiKey,
+          sensor.query,
+          since,
+          cursor
+        );
+    }
+
+    statuses.push(
+      result.status
     );
+
+    if (!result.ok) {
+      lastError =
+        result.error;
+
+      break;
+    }
 
     pagesFetched++;
 
-    for (const tweet of page.tweets) {
-      if (!tweet?.id) continue;
-
-      if (!seen.has(tweet.id)) {
-        seen.add(tweet.id);
-        tweets.push(tweet);
+    for (const tweet of result.tweets) {
+      if (!tweet?.id) {
+        continue;
       }
+
+      if (seen.has(tweet.id)) {
+        continue;
+      }
+
+      seen.add(tweet.id);
+      collected.push(tweet);
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | STOP PAGINATION
+    |--------------------------------------------------------------------------
+    */
+
+    if (!result.nextCursor) {
+      break;
     }
 
     if (
-      !page.hasNext ||
-      !page.nextCursor
+      result.nextCursor === cursor
     ) {
       break;
     }
 
-    if (page.nextCursor === cursor) {
-      break;
-    }
+    cursor =
+      result.nextCursor;
 
-    cursor = page.nextCursor;
+    /*
+    |--------------------------------------------------------------------------
+    | DELAY ANTAR PAGE
+    |--------------------------------------------------------------------------
+    */
+
+    if (
+      pageIndex + 1 <
+      maxPages
+    ) {
+      await sleep(5200);
+    }
   }
 
   return {
-    query,
+    id: sensor.id,
+
+    query:
+      sensor.query,
+
     pagesFetched,
-    count: tweets.length,
-    tweets
+
+    count:
+      collected.length,
+
+    statuses,
+
+    rateLimited,
+
+    error:
+      lastError,
+
+    tweets:
+      collected
   };
 }
 
-function cleanText(text = "") {
-  return text
-    .replace(/https?:\/\/\S+/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+/*
+|--------------------------------------------------------------------------
+| SPAM / NOISE FILTER
+|--------------------------------------------------------------------------
+*/
 
-function cryptoAddress(text = "") {
+function hasCryptoAddress(text = "") {
   const evm =
     /\b0x[a-fA-F0-9]{40}\b/;
 
+  /*
+  |--------------------------------------------------------------------------
+  | Solana-like address
+  |--------------------------------------------------------------------------
+  */
+
   const solana =
-    /\b[1-9A-HJ-NP-Za-km-z]{32,44}(?:pump)?\b/;
+    /\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/;
 
   return (
     evm.test(text) ||
@@ -184,97 +403,207 @@ function cryptoAddress(text = "") {
   );
 }
 
-function isNoise(text = "") {
-  const t = text
-    .toLowerCase()
-    .trim();
+function isLikelyReply(text = "") {
+  const t =
+    String(text).trim();
 
-  if (!t) return true;
-
-  if (t.startsWith("@")) {
+  if (!t) {
     return true;
   }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Tweet yang cuma reply akun
+  |--------------------------------------------------------------------------
+  */
 
   if (
-    BLOCKED.some(
-      (phrase) =>
-        t.includes(phrase)
-    )
+    /^@\w+\s+/i.test(t) &&
+    cleanText(t).length < 100
   ) {
-    return true;
-  }
-
-  if (
-    t.includes("ca:") ||
-    t.includes("contract:")
-  ) {
-    return true;
-  }
-
-  if (
-    cryptoAddress(text) &&
-    (
-      t.includes("moon") ||
-      t.includes("entry") ||
-      t.includes("ape") ||
-      t.includes("mc")
-    )
-  ) {
-    return true;
-  }
-
-  if (cleanText(text).length < 15) {
     return true;
   }
 
   return false;
 }
 
-function ageBoost(age) {
-  if (age <= 1) return 5;
-  if (age <= 2) return 4;
-  if (age <= 5) return 3;
-  if (age <= 10) return 2;
-  if (age <= 20) return 1.3;
+function isNoise(text = "") {
+  const original =
+    String(text);
+
+  const t =
+    original
+      .toLowerCase()
+      .trim();
+
+  if (!t) {
+    return true;
+  }
+
+  if (
+    cleanText(original).length <
+    15
+  ) {
+    return true;
+  }
+
+  if (
+    isLikelyReply(original)
+  ) {
+    return true;
+  }
+
+  for (
+    const phrase of
+    BLOCKED_PHRASES
+  ) {
+    if (
+      t.includes(phrase)
+    ) {
+      return true;
+    }
+  }
+
+  if (
+    t.includes("ca:") ||
+    t.includes("contract address:")
+  ) {
+    return true;
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Memecoin shill
+  |--------------------------------------------------------------------------
+  */
+
+  if (
+    hasCryptoAddress(original)
+  ) {
+    const shillWords = [
+      "moon",
+      "ape",
+      "entry",
+      "mc",
+      "market cap",
+      "send it",
+      "pump",
+      "gem",
+      "caller",
+      "calls"
+    ];
+
+    if (
+      shillWords.some(
+        (word) =>
+          t.includes(word)
+      )
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/*
+|--------------------------------------------------------------------------
+| AGE
+|--------------------------------------------------------------------------
+*/
+
+function ageBoost(ageMinutes) {
+  if (ageMinutes <= 1) {
+    return 5;
+  }
+
+  if (ageMinutes <= 2) {
+    return 4;
+  }
+
+  if (ageMinutes <= 5) {
+    return 3;
+  }
+
+  if (ageMinutes <= 10) {
+    return 2;
+  }
+
+  if (ageMinutes <= 20) {
+    return 1.3;
+  }
 
   return 1;
 }
 
+/*
+|--------------------------------------------------------------------------
+| KEYWORDS
+|--------------------------------------------------------------------------
+*/
+
 function extractKeywords(text = "") {
-  const cleaned = text
-    .replace(/https?:\/\/\S+/gi, " ")
-    .replace(/@\w+/g, " ")
-    .replace(
-      /[^\p{L}\p{N}#$\s]/gu,
-      " "
-    )
-    .toLowerCase();
+  const cleaned =
+    String(text)
+      .replace(
+        /https?:\/\/\S+/gi,
+        " "
+      )
+      .replace(
+        /@\w+/g,
+        " "
+      )
+      .replace(
+        /[^\p{L}\p{N}#$\s]/gu,
+        " "
+      )
+      .toLowerCase();
 
   const output = [];
 
-  for (
-    const word of cleaned
+  const words =
+    cleaned
       .split(/\s+/)
-      .filter(Boolean)
-  ) {
-    if (word.length < 3) continue;
-    if (STOP_WORDS.has(word)) continue;
+      .filter(Boolean);
 
-    if (!output.includes(word)) {
+  for (const word of words) {
+    if (word.length < 3) {
+      continue;
+    }
+
+    if (
+      STOP_WORDS.has(word)
+    ) {
+      continue;
+    }
+
+    if (
+      !output.includes(word)
+    ) {
       output.push(word);
     }
 
-    if (output.length >= 20) break;
+    if (
+      output.length >= 20
+    ) {
+      break;
+    }
   }
 
   return output;
 }
 
+/*
+|--------------------------------------------------------------------------
+| ENTITY EXTRACTION
+|--------------------------------------------------------------------------
+*/
+
 function extractEntities(text = "") {
   const cleaned =
     cleanText(text);
 
-  const caps =
+  const capitalized =
     cleaned.match(
       /\b[A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*){0,3}\b/g
     ) || [];
@@ -286,102 +615,161 @@ function extractEntities(text = "") {
 
   const hashtags =
     cleaned.match(
-      /#[A-Za-z][A-Za-z0-9_]{2,30}/g
+      /#[A-Za-z][A-Za-z0-9_]{2,40}/g
     ) || [];
 
   return [
     ...new Set(
       [
-        ...caps,
+        ...capitalized,
         ...tickers,
         ...hashtags
       ]
-        .map((x) =>
-          x.toLowerCase()
+        .map(
+          (value) =>
+            value
+              .toLowerCase()
+              .trim()
         )
         .filter(
-          (x) =>
-            x.length >= 3
+          (value) =>
+            value.length >= 3
         )
     )
-  ].slice(0, 12);
+  ].slice(0, 15);
 }
 
+/*
+|--------------------------------------------------------------------------
+| SIMILARITY
+|--------------------------------------------------------------------------
+*/
+
 function jaccard(a, b) {
-  if (!a.length || !b.length) {
+  if (
+    !a.length ||
+    !b.length
+  ) {
     return 0;
   }
 
-  const A = new Set(a);
-  const B = new Set(b);
+  const A =
+    new Set(a);
 
-  let shared = 0;
+  const B =
+    new Set(b);
 
-  for (const x of A) {
-    if (B.has(x)) {
-      shared++;
+  let intersection = 0;
+
+  for (const value of A) {
+    if (
+      B.has(value)
+    ) {
+      intersection++;
     }
   }
 
+  const union =
+    new Set([
+      ...A,
+      ...B
+    ]).size;
+
+  if (!union) {
+    return 0;
+  }
+
   return (
-    shared /
-    new Set([...A, ...B]).size
+    intersection /
+    union
   );
 }
 
 function clusterMatch(a, b) {
-  const entityMatch =
+  /*
+  |--------------------------------------------------------------------------
+  | Shared entity
+  |--------------------------------------------------------------------------
+  */
+
+  const sharedEntity =
     a.entities.some(
-      (x) =>
-        x.length >= 4 &&
-        b.entities.includes(x)
+      (entity) =>
+        entity.length >= 4 &&
+        b.entities.includes(entity)
     );
 
-  if (entityMatch) {
+  if (sharedEntity) {
     return true;
   }
 
-  const common =
+  /*
+  |--------------------------------------------------------------------------
+  | Shared keywords
+  |--------------------------------------------------------------------------
+  */
+
+  const sharedKeywords =
     a.keywords.filter(
-      (x) =>
-        b.keywords.includes(x)
+      (keyword) =>
+        b.keywords.includes(keyword)
     );
 
-  if (common.length >= 2) {
+  if (
+    sharedKeywords.length >= 2
+  ) {
     return true;
   }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Overall similarity
+  |--------------------------------------------------------------------------
+  */
 
   return (
     jaccard(
       a.keywords,
       b.keywords
-    ) >= 0.2
+    ) >= 0.22
   );
 }
+
+/*
+|--------------------------------------------------------------------------
+| CLUSTER
+|--------------------------------------------------------------------------
+*/
 
 function buildClusters(tweets) {
   const clusters = [];
 
   for (const tweet of tweets) {
-    let target = null;
+    let bestCluster = null;
 
-    for (const cluster of clusters) {
-      if (
+    for (
+      const cluster of
+      clusters
+    ) {
+      const matches =
         cluster.some(
           (member) =>
             clusterMatch(
               tweet,
               member
             )
-        )
-      ) {
-        target = cluster;
+        );
+
+      if (matches) {
+        bestCluster =
+          cluster;
+
         break;
       }
     }
 
-    if (target) {
-      target.push(tweet);
+    if (bestCluster) {
+      bestCluster.push(tweet);
     } else {
       clusters.push([tweet]);
     }
@@ -390,24 +778,44 @@ function buildClusters(tweets) {
   return clusters;
 }
 
-function narrativeName(cluster) {
+/*
+|--------------------------------------------------------------------------
+| NARRATIVE NAME
+|--------------------------------------------------------------------------
+*/
+
+function makeNarrativeName(cluster) {
   const entityCounts = {};
   const keywordCounts = {};
 
   for (const tweet of cluster) {
-    for (const x of tweet.entities) {
-      entityCounts[x] =
-        (entityCounts[x] || 0) + 1;
+    for (
+      const entity of
+      tweet.entities
+    ) {
+      entityCounts[entity] =
+        (
+          entityCounts[entity] ||
+          0
+        ) + 1;
     }
 
-    for (const x of tweet.keywords) {
-      keywordCounts[x] =
-        (keywordCounts[x] || 0) + 1;
+    for (
+      const keyword of
+      tweet.keywords
+    ) {
+      keywordCounts[keyword] =
+        (
+          keywordCounts[keyword] ||
+          0
+        ) + 1;
     }
   }
 
-  const entities =
-    Object.entries(entityCounts)
+  const goodEntities =
+    Object.entries(
+      entityCounts
+    )
       .filter(
         ([, count]) =>
           count >= 2
@@ -417,72 +825,119 @@ function narrativeName(cluster) {
           b[1] - a[1]
       )
       .slice(0, 3)
-      .map(([x]) => x);
+      .map(
+        ([entity]) =>
+          entity
+      );
 
-  if (entities.length) {
-    return entities.join(" ");
+  if (
+    goodEntities.length
+  ) {
+    return goodEntities.join(
+      " / "
+    );
   }
 
-  return Object.entries(keywordCounts)
+  return Object.entries(
+    keywordCounts
+  )
     .sort(
       (a, b) =>
         b[1] - a[1]
     )
     .slice(0, 4)
-    .map(([x]) => x)
-    .join(" ");
+    .map(
+      ([keyword]) =>
+        keyword
+    )
+    .join(" / ");
 }
 
-function processTweet(tweet, windowMinutes) {
-  const author =
-    tweet.author ||
-    tweet.user ||
-    {};
+/*
+|--------------------------------------------------------------------------
+| NORMALIZE TWEET
+|--------------------------------------------------------------------------
+*/
 
+function normalizeTweet(
+  tweet,
+  windowMinutes
+) {
   const username =
-    author.userName ||
-    author.username ||
-    tweet.userName ||
-    "";
+    getUsername(tweet);
 
   const text =
-    tweet.text || "";
+    String(
+      tweet?.text || ""
+    );
 
   const likes =
-    Number(tweet.likeCount) || 0;
+    Number(
+      tweet?.likeCount ??
+      tweet?.like_count ??
+      0
+    ) || 0;
 
   const replies =
-    Number(tweet.replyCount) || 0;
+    Number(
+      tweet?.replyCount ??
+      tweet?.reply_count ??
+      0
+    ) || 0;
 
   const reposts =
-    Number(tweet.retweetCount) || 0;
+    Number(
+      tweet?.retweetCount ??
+      tweet?.retweet_count ??
+      0
+    ) || 0;
 
   const quotes =
-    Number(tweet.quoteCount) || 0;
+    Number(
+      tweet?.quoteCount ??
+      tweet?.quote_count ??
+      0
+    ) || 0;
 
   const views =
-    Number(tweet.viewCount) || 0;
+    Number(
+      tweet?.viewCount ??
+      tweet?.view_count ??
+      0
+    ) || 0;
+
+  const createdAt =
+    getCreatedAt(tweet);
 
   let ageMinutes =
     windowMinutes;
 
-  if (tweet.createdAt) {
-    const ts =
+  if (createdAt) {
+    const timestamp =
       new Date(
-        tweet.createdAt
+        createdAt
       ).getTime();
 
-    if (!Number.isNaN(ts)) {
+    if (
+      !Number.isNaN(timestamp)
+    ) {
       ageMinutes =
         Math.max(
           0.25,
           (
             Date.now() -
-            ts
-          ) / 60000
+            timestamp
+          ) /
+          60000
         );
     }
   }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Weighted engagement
+  |--------------------------------------------------------------------------
+  */
 
   const engagement =
     likes +
@@ -492,20 +947,33 @@ function processTweet(tweet, windowMinutes) {
 
   const velocity =
     engagement /
-    ageMinutes;
+    Math.max(
+      ageMinutes,
+      0.25
+    );
+
+  /*
+  |--------------------------------------------------------------------------
+  | Early score
+  |--------------------------------------------------------------------------
+  */
 
   const earlyScore =
     velocity *
       ageBoost(ageMinutes) +
-    Math.log10(views + 1);
+    Math.log10(
+      views + 1
+    );
 
   return {
-    id: tweet.id,
+    id:
+      tweet.id,
+
     text,
+
     username,
 
-    createdAt:
-      tweet.createdAt || null,
+    createdAt,
 
     ageMinutes:
       Number(
@@ -517,6 +985,7 @@ function processTweet(tweet, windowMinutes) {
     reposts,
     quotes,
     views,
+
     engagement,
 
     velocity:
@@ -536,8 +1005,8 @@ function processTweet(tweet, windowMinutes) {
       extractEntities(text),
 
     url:
-      tweet.twitterUrl ||
-      tweet.url ||
+      tweet?.twitterUrl ||
+      tweet?.url ||
       (
         username
           ? `https://x.com/${username}/status/${tweet.id}`
@@ -546,19 +1015,34 @@ function processTweet(tweet, windowMinutes) {
   };
 }
 
-module.exports = async function (req, res) {
+/*
+|--------------------------------------------------------------------------
+| MAIN API
+|--------------------------------------------------------------------------
+*/
+
+module.exports =
+async function handler(req, res) {
   try {
     const apiKey =
-      process.env.TWITTER_API_KEY;
+      process.env
+        .TWITTER_API_KEY;
 
     if (!apiKey) {
       return res
         .status(500)
         .json({
+          ok: false,
           error:
             "TWITTER_API_KEY missing"
         });
     }
+
+    /*
+    |--------------------------------------------------------------------------
+    | QUERY SETTINGS
+    |--------------------------------------------------------------------------
+    */
 
     const minutes =
       clamp(
@@ -572,16 +1056,24 @@ module.exports = async function (req, res) {
       clamp(
         req.query.limit,
         1,
-        50,
-        20
+        30,
+        15
       );
+
+    /*
+    |--------------------------------------------------------------------------
+    | DEFAULT PAGES = 1
+    |
+    | Jangan dinaikkan dulu.
+    |--------------------------------------------------------------------------
+    */
 
     const pages =
       clamp(
         req.query.pages,
         1,
-        5,
-        3
+        2,
+        1
       );
 
     const since =
@@ -590,41 +1082,99 @@ module.exports = async function (req, res) {
       ) -
       minutes * 60;
 
-    const sensorResults =
-      await Promise.all(
-        SENSORS.map(
-          (query) =>
-            collectSensor(
-              apiKey,
-              query,
-              since,
-              pages
-            )
-        )
+    /*
+    |--------------------------------------------------------------------------
+    | COLLECT SENSORS SEQUENTIALLY
+    |--------------------------------------------------------------------------
+    */
+
+    const sensorResults = [];
+
+    for (
+      let i = 0;
+      i < SENSORS.length;
+      i++
+    ) {
+      const sensor =
+        SENSORS[i];
+
+      const result =
+        await collectSensor(
+          apiKey,
+          sensor,
+          since,
+          pages
+        );
+
+      sensorResults.push(
+        result
       );
 
-    const raw =
+      /*
+      |--------------------------------------------------------------------------
+      | Delay antar sensor.
+      |--------------------------------------------------------------------------
+      */
+
+      if (
+        i <
+        SENSORS.length - 1
+      ) {
+        await sleep(5200);
+      }
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | MERGE
+    |--------------------------------------------------------------------------
+    */
+
+    const rawTweets =
       sensorResults.flatMap(
-        (x) => x.tweets
+        (sensor) =>
+          sensor.tweets
       );
 
-    const unique =
-      Array.from(
-        new Map(
-          raw.map(
-            (tweet) => [
-              tweet.id,
-              tweet
-            ]
-          )
-        ).values()
+    /*
+    |--------------------------------------------------------------------------
+    | DEDUPE
+    |--------------------------------------------------------------------------
+    */
+
+    const uniqueMap =
+      new Map();
+
+    for (
+      const tweet of
+      rawTweets
+    ) {
+      if (!tweet?.id) {
+        continue;
+      }
+
+      uniqueMap.set(
+        tweet.id,
+        tweet
       );
+    }
+
+    const uniqueTweets =
+      Array.from(
+        uniqueMap.values()
+      );
+
+    /*
+    |--------------------------------------------------------------------------
+    | NORMALIZE + FILTER
+    |--------------------------------------------------------------------------
+    */
 
     const processed =
-      unique
+      uniqueTweets
         .map(
           (tweet) =>
-            processTweet(
+            normalizeTweet(
               tweet,
               minutes
             )
@@ -637,18 +1187,33 @@ module.exports = async function (req, res) {
         )
         .filter(
           (tweet) => {
+            /*
+            |--------------------------------------------------------------------------
+            | Super fresh tweets jangan terlalu keras difilter.
+            |--------------------------------------------------------------------------
+            */
+
+            if (
+              tweet.ageMinutes <= 2
+            ) {
+              return (
+                tweet.engagement > 0 ||
+                tweet.views >= 2
+              );
+            }
+
             if (
               tweet.ageMinutes <= 5
             ) {
               return (
                 tweet.engagement > 0 ||
-                tweet.views >= 3
+                tweet.views >= 5
               );
             }
 
             return (
               tweet.engagement > 0 ||
-              tweet.views >= 15
+              tweet.views >= 20
             );
           }
         )
@@ -658,6 +1223,12 @@ module.exports = async function (req, res) {
             a.earlyScore
         );
 
+    /*
+    |--------------------------------------------------------------------------
+    | BUILD NARRATIVES
+    |--------------------------------------------------------------------------
+    */
+
     const clusters =
       buildClusters(
         processed
@@ -665,199 +1236,381 @@ module.exports = async function (req, res) {
 
     const narratives =
       clusters
-        .map((cluster) => {
-          const accounts =
-            new Set(
-              cluster
-                .map(
-                  (x) =>
-                    x.username
-                )
-                .filter(Boolean)
-            );
-
-          const uniqueAccounts =
-            accounts.size;
-
-          const mentions =
-            cluster.length;
-
-          const avgAge =
-            cluster.reduce(
-              (sum, x) =>
-                sum +
-                x.ageMinutes,
-              0
-            ) / mentions;
-
-          const engagement =
-            cluster.reduce(
-              (sum, x) =>
-                sum +
-                x.engagement,
-              0
-            );
-
-          const views =
-            cluster.reduce(
-              (sum, x) =>
-                sum +
-                x.views,
-              0
-            );
-
-          const velocity =
-            cluster.reduce(
-              (sum, x) =>
-                sum +
-                x.velocity,
-              0
-            );
-
-          const accountBoost =
-            uniqueAccounts >= 5
-              ? 4
-              : uniqueAccounts >= 3
-                ? 2.8
-                : uniqueAccounts >= 2
-                  ? 1.8
-                  : 1;
-
-          const burstBoost =
-            avgAge <= 2
-              ? 3
-              : avgAge <= 5
-                ? 2
-                : avgAge <= 10
-                  ? 1.4
-                  : 1;
-
-          const score =
-            (
-              velocity +
-              Math.log10(
-                views + 1
-              ) +
-              mentions
-            ) *
-            accountBoost *
-            burstBoost;
-
-          let status = "WATCH";
-
-          if (
-            uniqueAccounts >= 2 &&
-            avgAge <= 5
-          ) {
-            status = "EARLY";
-          }
-
-          if (
-            uniqueAccounts >= 3 &&
-            score >= 25
-          ) {
-            status = "RISING";
-          }
-
-          if (
-            uniqueAccounts >= 5 &&
-            score >= 80
-          ) {
-            status = "BREAKING";
-          }
-
-          return {
-            narrative:
-              narrativeName(
+        .map(
+          (cluster) => {
+            const accounts =
+              new Set(
                 cluster
-              ),
+                  .map(
+                    (tweet) =>
+                      tweet.username
+                  )
+                  .filter(Boolean)
+              );
 
-            status,
-            mentions,
-            uniqueAccounts,
+            const uniqueAccounts =
+              accounts.size;
 
-            avgAgeMinutes:
-              Number(
-                avgAge.toFixed(2)
-              ),
+            const mentions =
+              cluster.length;
 
-            engagement,
-            views,
+            const avgAge =
+              cluster.reduce(
+                (sum, tweet) =>
+                  sum +
+                  tweet.ageMinutes,
+                0
+              ) /
+              mentions;
 
-            velocity:
-              Number(
-                velocity.toFixed(2)
-              ),
+            const totalEngagement =
+              cluster.reduce(
+                (sum, tweet) =>
+                  sum +
+                  tweet.engagement,
+                0
+              );
 
-            score:
-              Number(
-                score.toFixed(2)
-              ),
+            const totalViews =
+              cluster.reduce(
+                (sum, tweet) =>
+                  sum +
+                  tweet.views,
+                0
+              );
 
-            topTweets:
-              [...cluster]
-                .sort(
-                  (a, b) =>
-                    b.earlyScore -
-                    a.earlyScore
+            const totalVelocity =
+              cluster.reduce(
+                (sum, tweet) =>
+                  sum +
+                  tweet.velocity,
+                0
+              );
+
+            /*
+            |--------------------------------------------------------------------------
+            | RECENT MENTIONS
+            |--------------------------------------------------------------------------
+            */
+
+            const recent5 =
+              cluster.filter(
+                (tweet) =>
+                  tweet.ageMinutes <= 5
+              ).length;
+
+            const older =
+              cluster.filter(
+                (tweet) =>
+                  tweet.ageMinutes > 5
+              ).length;
+
+            /*
+            |--------------------------------------------------------------------------
+            | BURST
+            |--------------------------------------------------------------------------
+            */
+
+            const recentRate =
+              recent5 / 5;
+
+            const olderWindow =
+              Math.max(
+                minutes - 5,
+                1
+              );
+
+            const olderRate =
+              older /
+              olderWindow;
+
+            const burstRatio =
+              olderRate > 0
+                ? recentRate /
+                  olderRate
+                : recent5 > 0
+                  ? 2
+                  : 1;
+
+            /*
+            |--------------------------------------------------------------------------
+            | ACCOUNT BOOST
+            |--------------------------------------------------------------------------
+            */
+
+            let accountBoost = 1;
+
+            if (
+              uniqueAccounts >= 5
+            ) {
+              accountBoost = 4;
+            } else if (
+              uniqueAccounts >= 3
+            ) {
+              accountBoost = 2.7;
+            } else if (
+              uniqueAccounts >= 2
+            ) {
+              accountBoost = 1.8;
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | AGE BOOST
+            |--------------------------------------------------------------------------
+            */
+
+            let clusterAgeBoost = 1;
+
+            if (avgAge <= 2) {
+              clusterAgeBoost = 2.5;
+            } else if (
+              avgAge <= 5
+            ) {
+              clusterAgeBoost = 2;
+            } else if (
+              avgAge <= 10
+            ) {
+              clusterAgeBoost = 1.4;
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | SCORE
+            |--------------------------------------------------------------------------
+            */
+
+            const score =
+              (
+                totalVelocity +
+                Math.log10(
+                  totalViews + 1
+                ) +
+                mentions +
+                Math.min(
+                  burstRatio,
+                  5
                 )
-                .slice(0, 4)
-                .map((x) => ({
-                  username:
-                    x.username,
+              ) *
+              accountBoost *
+              clusterAgeBoost;
 
-                  text:
-                    x.text,
+            /*
+            |--------------------------------------------------------------------------
+            | STATUS
+            |--------------------------------------------------------------------------
+            */
 
-                  ageMinutes:
-                    x.ageMinutes,
+            let status =
+              "WATCH";
 
-                  engagement:
-                    x.engagement,
+            if (
+              uniqueAccounts >= 2 &&
+              avgAge <= 5
+            ) {
+              status =
+                "EARLY";
+            }
 
-                  views:
-                    x.views,
+            if (
+              uniqueAccounts >= 3 &&
+              (
+                score >= 25 ||
+                burstRatio >= 2
+              )
+            ) {
+              status =
+                "RISING";
+            }
 
-                  url:
-                    x.url
-                }))
-          };
-        })
-        .filter(
-          (x) =>
-            x.uniqueAccounts >= 2
+            if (
+              uniqueAccounts >= 5 &&
+              score >= 70
+            ) {
+              status =
+                "BREAKING";
+            }
+
+            return {
+              narrative:
+                makeNarrativeName(
+                  cluster
+                ),
+
+              status,
+
+              mentions,
+
+              uniqueAccounts,
+
+              recent5Minutes:
+                recent5,
+
+              avgAgeMinutes:
+                Number(
+                  avgAge.toFixed(2)
+                ),
+
+              engagement:
+                totalEngagement,
+
+              views:
+                totalViews,
+
+              velocity:
+                Number(
+                  totalVelocity.toFixed(2)
+                ),
+
+              burstRatio:
+                Number(
+                  burstRatio.toFixed(2)
+                ),
+
+              score:
+                Number(
+                  score.toFixed(2)
+                ),
+
+              topTweets:
+                [...cluster]
+                  .sort(
+                    (a, b) =>
+                      b.earlyScore -
+                      a.earlyScore
+                  )
+                  .slice(0, 4)
+                  .map(
+                    (tweet) => ({
+                      username:
+                        tweet.username,
+
+                      text:
+                        tweet.text,
+
+                      ageMinutes:
+                        tweet.ageMinutes,
+
+                      engagement:
+                        tweet.engagement,
+
+                      views:
+                        tweet.views,
+
+                      url:
+                        tweet.url
+                    })
+                  )
+            };
+          }
         )
+
+        /*
+        |--------------------------------------------------------------------------
+        | Butuh minimal dua akun berbeda supaya disebut narrative.
+        |--------------------------------------------------------------------------
+        */
+
+        .filter(
+          (narrative) =>
+            narrative
+              .uniqueAccounts >= 2
+        )
+
         .sort(
           (a, b) =>
-            b.score - a.score
+            b.score -
+            a.score
         )
-        .slice(0, limit);
+
+        .slice(
+          0,
+          limit
+        );
+
+    /*
+    |--------------------------------------------------------------------------
+    | SUPER EARLY SIGNALS
+    |--------------------------------------------------------------------------
+    */
 
     const signals =
       processed
         .filter(
-          (x) =>
-            x.ageMinutes <= 5
+          (tweet) =>
+            tweet.ageMinutes <= 5
         )
-        .slice(0, 15)
-        .map((x) => ({
-          text: x.text,
-          username: x.username,
-          ageMinutes: x.ageMinutes,
-          engagement: x.engagement,
-          views: x.views,
-          score: x.earlyScore,
-          url: x.url
-        }));
+
+        .sort(
+          (a, b) =>
+            b.earlyScore -
+            a.earlyScore
+        )
+
+        .slice(
+          0,
+          15
+        )
+
+        .map(
+          (tweet) => ({
+            text:
+              tweet.text,
+
+            username:
+              tweet.username,
+
+            ageMinutes:
+              tweet.ageMinutes,
+
+            engagement:
+              tweet.engagement,
+
+            views:
+              tweet.views,
+
+            score:
+              tweet.earlyScore,
+
+            url:
+              tweet.url
+          })
+        );
+
+    /*
+    |--------------------------------------------------------------------------
+    | SENSOR DEBUG
+    |--------------------------------------------------------------------------
+    */
 
     const sensorStats =
       sensorResults.map(
-        (x) => ({
-          query: x.query,
-          pages: x.pagesFetched,
-          tweets: x.count
+        (sensor) => ({
+          id:
+            sensor.id,
+
+          pages:
+            sensor.pagesFetched,
+
+          tweets:
+            sensor.count,
+
+          statuses:
+            sensor.statuses,
+
+          rateLimited:
+            sensor.rateLimited,
+
+          error:
+            sensor.error
         })
       );
+
+    /*
+    |--------------------------------------------------------------------------
+    | RESPONSE
+    |--------------------------------------------------------------------------
+    */
 
     return res
       .status(200)
@@ -865,7 +1618,7 @@ module.exports = async function (req, res) {
         ok: true,
 
         mode:
-          "narrative-radar-v2",
+          "narrative-radar-v3",
 
         windowMinutes:
           minutes,
@@ -877,10 +1630,10 @@ module.exports = async function (req, res) {
           SENSORS.length,
 
         rawFetched:
-          raw.length,
+          rawTweets.length,
 
         scanned:
-          unique.length,
+          uniqueTweets.length,
 
         qualified:
           processed.length,
@@ -888,17 +1641,32 @@ module.exports = async function (req, res) {
         narrativeCount:
           narratives.length,
 
+        earlyNarrativeCount:
+          narratives.filter(
+            (item) =>
+              item.status ===
+                "EARLY" ||
+              item.status ===
+                "RISING" ||
+              item.status ===
+                "BREAKING"
+          ).length,
+
         narratives,
 
         signals,
 
         sensorStats
       });
-
   } catch (error) {
     return res
       .status(500)
       .json({
+        ok: false,
+
+        mode:
+          "narrative-radar-v3",
+
         error:
           String(error)
       });
